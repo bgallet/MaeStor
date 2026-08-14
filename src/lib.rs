@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod logging;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -15,6 +16,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::net::TcpListener;
+
+/// How long to wait after a failed `accept()` before trying again, so that a
+/// persistent error (e.g. file-descriptor exhaustion) does not spin the CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub async fn handle_request(
     req: Request<Incoming>,
@@ -47,6 +52,9 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<SocketAddr> {
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::error!(error = %err, "accept error");
+                    // Back off so a persistent condition (EMFILE/ENFILE under
+                    // load) does not turn into a 100%-CPU busy loop.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
             };
