@@ -28,7 +28,18 @@ pub async fn handle_request(
 
     let response = match routing::parse_request(&method, &path, query.as_deref(), &headers) {
         Ok(op) => logging::log_dispatch(&user, op).await,
-        Err(err) => Err(err),
+        Err(err) => {
+            let status = err.status_code().as_u16();
+            tracing::info!(
+                user = %user,
+                operation = "ParseError",
+                duration_ms = 0u64,
+                bytes = 0u64,
+                status,
+                "s3_request"
+            );
+            Err(err)
+        }
     };
 
     Ok(response.unwrap_or_else(|err| err.to_response()))
