@@ -9,16 +9,20 @@ use tracing::info;
 use crate::error::S3Error;
 use crate::operation::{dispatch, S3Operation};
 
+/// Initializes the global JSON tracing subscriber. Honors `RUST_LOG` (falling
+/// back to `info` when unset). Safe to call more than once — later calls are
+/// no-ops rather than panicking, since a second `main`-style init would
+/// otherwise crash a process that only wanted to log a warning.
 pub fn init() {
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .json()
         .with_current_span(false)
-        .init();
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
 }
-
-/// Operation name reported when the request could not be parsed into an
-/// `S3Operation` at all.
-const PARSE_ERROR_OPERATION: &str = "ParseError";
 
 /// The single owner of the `s3_request` log event.
 ///
@@ -31,7 +35,9 @@ const PARSE_ERROR_OPERATION: &str = "ParseError";
 ///   converted into its XML error response.
 ///
 /// Either way exactly one `s3_request` event is emitted, and `bytes` measures
-/// the body of the response that actually goes out over the wire.
+/// the body of the response that actually goes out over the wire. `operation`
+/// is `None` when routing itself failed, since there is no `S3Operation` to
+/// report in that case.
 pub async fn log_request(
     user: &str,
     parsed: Result<S3Operation, S3Error>,
@@ -41,9 +47,9 @@ pub async fn log_request(
     let (operation, result) = match parsed {
         Ok(op) => {
             let name = op.name();
-            (name, dispatch(&op).await)
+            (Some(name), dispatch(&op).await)
         }
-        Err(err) => (PARSE_ERROR_OPERATION, Err(err)),
+        Err(err) => (None, Err(err)),
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
