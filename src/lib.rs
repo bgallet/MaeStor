@@ -17,7 +17,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::oneshot;
 
 /// How long to wait after a failed `accept()` before trying again, so that a
 /// persistent error (e.g. file-descriptor exhaustion) does not spin the CPU.
@@ -60,7 +60,7 @@ pub async fn handle_request(
 /// signal handling) call `shutdown()` explicitly.
 pub struct ServerHandle {
     addr: SocketAddr,
-    shutdown_tx: watch::Sender<()>,
+    shutdown_tx: oneshot::Sender<()>,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -75,9 +75,8 @@ impl ServerHandle {
     /// finish, up to [`GRACEFUL_SHUTDOWN_TIMEOUT`], then wait for the accept
     /// loop itself to exit.
     pub async fn shutdown(self) {
-        // The receiver was already dropped inside the accept loop's `select!`
-        // once it observed this signal, so a send error here just means the
-        // loop is already on its way out — nothing to do about it.
+        // A send error here means the accept loop's task has already ended
+        // on its own — nothing to do about it.
         let _ = self.shutdown_tx.send(());
         let _ = self.join_handle.await;
     }
@@ -86,7 +85,7 @@ impl ServerHandle {
 pub async fn serve(addr: SocketAddr) -> std::io::Result<ServerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     // Not Clone by design (see hyper_util's docs): stays owned by this task
     // for its whole life, and is consumed exactly once by `.shutdown()`
     // below. Each connection instead gets an owned `Watcher` (see
@@ -122,20 +121,20 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<ServerHandle> {
                         }
                     });
                 }
-                _ = shutdown_rx.changed() => {
+                _ = &mut shutdown_rx => {
                     tracing::info!("shutdown requested; no longer accepting new connections");
                     break;
                 }
             }
         }
 
-        tokio::select! {
-            () = graceful.shutdown() => {
-                tracing::info!("all connections closed gracefully");
-            }
-            _ = tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT) => {
-                tracing::warn!("graceful shutdown timed out; dropping remaining connections");
-            }
+        if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("graceful shutdown timed out; dropping remaining connections");
+        } else {
+            tracing::info!("all connections closed gracefully");
         }
     });
 
