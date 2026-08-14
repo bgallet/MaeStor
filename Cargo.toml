@@ -13,4 +13,4 @@ http-body-util = "0.1"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-url = "2"
+percent-encoding = "2"

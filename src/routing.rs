@@ -11,7 +11,7 @@ pub fn parse_request(
     query: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<S3Operation, S3Error> {
-    let params = parse_query(query);
+    let params = parse_query(query)?;
     let trimmed = path.trim_start_matches('/');
 
     if trimmed.is_empty() {
@@ -21,22 +21,49 @@ pub fn parse_request(
         };
     }
 
+    // Split on the raw path so that an encoded slash (`%2F`) inside a key is
+    // not mistaken for a path separator, then decode each segment.
     match trimmed.split_once('/') {
-        Some((bucket, key)) if !key.is_empty() => {
-            parse_object_operation(method, bucket, key, &params, headers)
-        }
-        Some((bucket, _)) => parse_bucket_operation(method, bucket, &params),
-        None => parse_bucket_operation(method, trimmed, &params),
+        Some((bucket, key)) if !key.is_empty() => parse_object_operation(
+            method,
+            &percent_decode(bucket)?,
+            &percent_decode(key)?,
+            &params,
+            headers,
+        ),
+        Some((bucket, _)) => parse_bucket_operation(method, &percent_decode(bucket)?, &params),
+        None => parse_bucket_operation(method, &percent_decode(trimmed)?, &params),
     }
 }
 
-fn parse_query(query: Option<&str>) -> HashMap<String, String> {
-    match query {
-        None => HashMap::new(),
-        Some(q) => url::form_urlencoded::parse(q.as_bytes())
-            .into_owned()
-            .collect(),
+/// Decode `%XX` escapes. Unlike `application/x-www-form-urlencoded` decoding,
+/// a literal `+` is left alone — AWS's canonical encoding treats `+` as a
+/// literal character and encodes a space as `%20`.
+fn percent_decode(value: &str) -> Result<String, S3Error> {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| S3Error::InvalidRequest)
+}
+
+fn parse_query(query: Option<&str>) -> Result<HashMap<String, String>, S3Error> {
+    let mut params = HashMap::new();
+    let Some(query) = query else {
+        return Ok(params);
+    };
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        };
+        params.insert(percent_decode(key)?, percent_decode(value)?);
     }
+
+    Ok(params)
 }
 
 fn parse_bucket_operation(
@@ -249,6 +276,38 @@ mod tests {
             (
                 Method::GET,
                 "/my-bucket",
+                Some("tagging"),
+                S3Operation::GetBucketTagging {
+                    bucket: "my-bucket".to_string(),
+                },
+            ),
+            (
+                Method::PUT,
+                "/my-bucket",
+                Some("tagging"),
+                S3Operation::PutBucketTagging {
+                    bucket: "my-bucket".to_string(),
+                },
+            ),
+            (
+                Method::DELETE,
+                "/my-bucket",
+                Some("tagging"),
+                S3Operation::DeleteBucketTagging {
+                    bucket: "my-bucket".to_string(),
+                },
+            ),
+            (
+                Method::GET,
+                "/my-bucket",
+                Some("versioning"),
+                S3Operation::GetBucketVersioning {
+                    bucket: "my-bucket".to_string(),
+                },
+            ),
+            (
+                Method::GET,
+                "/my-bucket",
                 Some("uploads"),
                 S3Operation::ListMultipartUploads {
                     bucket: "my-bucket".to_string(),
@@ -300,10 +359,28 @@ mod tests {
                 },
             ),
             (
+                Method::GET,
+                "/my-bucket/my-key",
+                Some("tagging"),
+                S3Operation::GetObjectTagging {
+                    bucket: "my-bucket".to_string(),
+                    key: "my-key".to_string(),
+                },
+            ),
+            (
                 Method::PUT,
                 "/my-bucket/my-key",
                 Some("tagging"),
                 S3Operation::PutObjectTagging {
+                    bucket: "my-bucket".to_string(),
+                    key: "my-key".to_string(),
+                },
+            ),
+            (
+                Method::DELETE,
+                "/my-bucket/my-key",
+                Some("tagging"),
+                S3Operation::DeleteObjectTagging {
                     bucket: "my-bucket".to_string(),
                     key: "my-key".to_string(),
                 },
@@ -393,6 +470,103 @@ mod tests {
             Some("uploadId=up1"),
             &empty,
         );
+        assert_eq!(result, Err(S3Error::InvalidRequest));
+    }
+
+    #[test]
+    fn path_segments_are_percent_decoded() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::GET, "/my%20bucket/my%20key", None, &empty);
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetObject {
+                bucket: "my bucket".to_string(),
+                key: "my key".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn encoded_slash_in_key_is_decoded_without_splitting_the_bucket() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::GET, "/my-bucket/dir%2Ffile.txt", None, &empty);
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetObject {
+                bucket: "my-bucket".to_string(),
+                key: "dir/file.txt".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn plus_in_path_is_a_literal_plus_not_a_space() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::GET, "/my-bucket/a+b", None, &empty);
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetObject {
+                bucket: "my-bucket".to_string(),
+                key: "a+b".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn query_value_keeps_literal_plus() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/my-bucket/my-key",
+            Some("uploadId=ab+cd"),
+            &empty,
+        );
+        assert_eq!(
+            result,
+            Ok(S3Operation::ListParts {
+                bucket: "my-bucket".to_string(),
+                key: "my-key".to_string(),
+                upload_id: "ab+cd".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn query_value_percent_escapes_are_decoded() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/my-bucket/my-key",
+            Some("uploadId=ab%20cd"),
+            &empty,
+        );
+        assert_eq!(
+            result,
+            Ok(S3Operation::ListParts {
+                bucket: "my-bucket".to_string(),
+                key: "my-key".to_string(),
+                upload_id: "ab cd".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn valueless_query_marker_still_registers() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::GET, "/my-bucket", Some("acl"), &empty);
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetBucketAcl {
+                bucket: "my-bucket".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_percent_encoding_is_invalid_request() {
+        let empty = HeaderMap::new();
+        // %FF is not valid UTF-8 once decoded.
+        let result = parse_request(&Method::GET, "/my-bucket/bad%FFkey", None, &empty);
         assert_eq!(result, Err(S3Error::InvalidRequest));
     }
 
