@@ -12,7 +12,11 @@ pub fn parse_request(
     headers: &HeaderMap,
 ) -> Result<S3Operation, S3Error> {
     let params = parse_query(query)?;
-    let trimmed = path.trim_start_matches('/');
+    // Strip exactly one leading slash, matching how a URI path is anchored —
+    // a stray extra slash (e.g. "//bucket/key") is part of the path, not
+    // something to collapse away, since it changes which segment is the
+    // bucket name.
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
 
     if trimmed.is_empty() {
         return match *method {
@@ -577,6 +581,21 @@ mod tests {
         // %FF is not valid UTF-8 once decoded.
         let result = parse_request(&Method::GET, "/my-bucket/bad%FFkey", None, &empty);
         assert_eq!(result, Err(S3Error::InvalidRequest));
+    }
+
+    #[test]
+    fn extra_leading_slash_is_not_collapsed() {
+        let empty = HeaderMap::new();
+        // A stray extra leading slash shifts what the bucket segment is; it
+        // must not be silently trimmed away like the well-formed case.
+        let result = parse_request(&Method::GET, "//bucket/key", None, &empty);
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetObject {
+                bucket: String::new(),
+                key: "bucket/key".to_string(),
+            })
+        );
     }
 
     #[test]
