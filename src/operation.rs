@@ -235,4 +235,75 @@ mod tests {
         let result = dispatch(&op).await;
         assert_eq!(result.unwrap_err(), crate::error::S3Error::NotImplemented);
     }
+
+    /// Every stub handler currently returns the same `NotImplemented` error, so
+    /// this can only prove each arm reaches *a* handler rather than panicking or
+    /// failing to compile against the wrong signature. It is still worth having:
+    /// it pins the arms across both handler modules, including the multipart
+    /// variants whose extra fields are the easiest to mis-wire.
+    #[tokio::test]
+    async fn dispatch_routes_a_representative_sample_of_operations() {
+        let bucket = "b".to_string();
+        let key = "k".to_string();
+        let upload_id = "u1".to_string();
+
+        let ops = vec![
+            S3Operation::DeleteBucket {
+                bucket: bucket.clone(),
+            },
+            S3Operation::ListObjects {
+                bucket: bucket.clone(),
+            },
+            S3Operation::GetBucketVersioning {
+                bucket: bucket.clone(),
+            },
+            S3Operation::GetObject {
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            S3Operation::PutObject {
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            S3Operation::DeleteObjectTagging {
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            S3Operation::CopyObject {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                source: "/src/obj".to_string(),
+            },
+            S3Operation::CreateMultipartUpload {
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            S3Operation::UploadPart {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                part_number: 2,
+                upload_id: upload_id.clone(),
+            },
+            S3Operation::CompleteMultipartUpload {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+            },
+            S3Operation::ListParts {
+                bucket,
+                key,
+                upload_id,
+            },
+        ];
+
+        for op in ops {
+            let result = dispatch(&op).await;
+            assert_eq!(
+                result.unwrap_err(),
+                crate::error::S3Error::NotImplemented,
+                "operation {} should dispatch to a not-implemented stub",
+                op.name()
+            );
+        }
+    }
 }
