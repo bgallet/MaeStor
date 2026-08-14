@@ -24,13 +24,16 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 pub async fn handle_request(
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().map(str::to_string);
-    let headers = req.headers().clone();
-
-    let user = auth::extract_user(&headers);
-    let parsed = routing::parse_request(&method, &path, query.as_deref(), &headers);
+    // Borrow directly from `req` rather than cloning method/path/query/headers
+    // up front — nothing here needs to outlive the borrow, since `user` and
+    // `parsed` are both owned before `req` is consumed below.
+    let user = auth::extract_user(req.headers());
+    let parsed = routing::parse_request(
+        req.method(),
+        req.uri().path(),
+        req.uri().query(),
+        req.headers(),
+    );
 
     // Handlers are stubs and do not read the body yet, but HTTP/1.1 keep-alive
     // requires the request body to be fully consumed before the connection can
