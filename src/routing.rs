@@ -359,6 +359,15 @@ mod tests {
                 },
             ),
             (
+                Method::PUT,
+                "/my-bucket/my-key",
+                Some("acl"),
+                S3Operation::PutObjectAcl {
+                    bucket: "my-bucket".to_string(),
+                    key: "my-key".to_string(),
+                },
+            ),
+            (
                 Method::GET,
                 "/my-bucket/my-key",
                 Some("tagging"),
