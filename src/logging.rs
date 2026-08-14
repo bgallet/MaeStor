@@ -7,7 +7,8 @@ use http_body_util::Full;
 use tracing::info;
 
 use crate::error::S3Error;
-use crate::operation::{dispatch, S3Operation};
+use crate::handlers::dispatch;
+use crate::operation::S3Operation;
 
 /// Initializes the global JSON tracing subscriber. Honors `RUST_LOG` (falling
 /// back to `info` when unset). Safe to call more than once — later calls are
