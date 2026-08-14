@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -26,6 +26,13 @@ pub async fn handle_request(
 
     let user = auth::extract_user(&headers);
     let parsed = routing::parse_request(&method, &path, query.as_deref(), &headers);
+
+    // Handlers are stubs and do not read the body yet, but HTTP/1.1 keep-alive
+    // requires the request body to be fully consumed before the connection can
+    // be reused. Drain and discard it.
+    if let Err(err) = req.into_body().collect().await {
+        tracing::warn!(error = %err, "failed to drain request body");
+    }
 
     Ok(logging::log_request(&user, parsed).await)
 }
