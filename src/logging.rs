@@ -16,56 +16,102 @@ pub fn init() {
         .init();
 }
 
-pub async fn log_dispatch(
+/// Operation name reported when the request could not be parsed into an
+/// `S3Operation` at all.
+const PARSE_ERROR_OPERATION: &str = "ParseError";
+
+/// The single owner of the `s3_request` log event.
+///
+/// Takes the output of `routing::parse_request` and drives it all the way to a
+/// final `Response`:
+///
+/// * `Ok(op)` — times the dispatch, converting a handler error into its XML
+///   error response.
+/// * `Err(err)` — no dispatch happens (duration is ~0), the parse error is
+///   converted into its XML error response.
+///
+/// Either way exactly one `s3_request` event is emitted, and `bytes` measures
+/// the body of the response that actually goes out over the wire.
+pub async fn log_request(
     user: &str,
-    op: S3Operation,
-) -> Result<Response<Full<Bytes>>, S3Error> {
+    parsed: Result<S3Operation, S3Error>,
+) -> Response<Full<Bytes>> {
     let start = Instant::now();
-    let op_name = op.name();
 
-    let result = dispatch(&op).await;
-    let duration_ms = start.elapsed().as_millis();
-
-    let (status, bytes) = match &result {
-        Ok(resp) => (
-            resp.status().as_u16(),
-            resp.body().size_hint().exact().unwrap_or(0),
-        ),
-        Err(err) => (err.status_code().as_u16(), 0),
+    let (operation, result) = match parsed {
+        Ok(op) => {
+            let name = op.name();
+            (name, dispatch(&op).await)
+        }
+        Err(err) => (PARSE_ERROR_OPERATION, Err(err)),
     };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let response = match result {
+        Ok(response) => response,
+        Err(err) => err.to_response(),
+    };
+
+    let status = response.status().as_u16();
+    let bytes = response.body().size_hint().exact().unwrap_or(0);
 
     info!(
         user,
-        operation = op_name,
+        operation,
         duration_ms,
         bytes,
         status,
         "s3_request"
     );
 
-    result
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::StatusCode;
+    use http_body_util::BodyExt;
 
-    #[tokio::test]
-    async fn log_dispatch_forwards_success_result() {
-        let result = log_dispatch("test-user", S3Operation::ListBuckets).await;
-        assert_eq!(result.expect("should succeed").status(), StatusCode::OK);
+    async fn body_string(response: Response<Full<Bytes>>) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("valid utf8")
     }
 
     #[tokio::test]
-    async fn log_dispatch_forwards_error_result() {
+    async fn log_request_forwards_success_result() {
+        let response = log_request("test-user", Ok(S3Operation::ListBuckets)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_string(response).await.contains("ListAllMyBucketsResult"));
+    }
+
+    #[tokio::test]
+    async fn log_request_converts_dispatch_error_to_response() {
         let op = S3Operation::CreateBucket {
             bucket: "b".to_string(),
         };
-        let result = log_dispatch("test-user", op).await;
-        assert_eq!(
-            result.unwrap_err(),
-            crate::error::S3Error::NotImplemented
-        );
+        let response = log_request("test-user", Ok(op)).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(body_string(response).await.contains("NotImplemented"));
+    }
+
+    #[tokio::test]
+    async fn log_request_converts_parse_error_to_response() {
+        let response = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(body_string(response).await.contains("MethodNotAllowed"));
+    }
+
+    #[tokio::test]
+    async fn error_responses_have_a_non_empty_measurable_body() {
+        let response = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        let bytes = response.body().size_hint().exact().expect("exact size hint");
+        assert!(bytes > 0, "error responses must report real byte counts");
     }
 }
