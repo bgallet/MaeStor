@@ -81,6 +81,7 @@ mod tests {
     use super::*;
     use http::StatusCode;
     use http_body_util::BodyExt;
+    use tracing_test::traced_test;
 
     async fn body_string(response: Response<Full<Bytes>>) -> String {
         let bytes = response
@@ -121,5 +122,122 @@ mod tests {
         let response = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
         let bytes = response.body().size_hint().exact().expect("exact size hint");
         assert!(bytes > 0, "error responses must report real byte counts");
+    }
+
+    // The tests above only ever assert on the `Response` `log_request` hands
+    // back — none of them look at what actually got logged. The tests below
+    // close that gap.
+
+    #[traced_test]
+    #[tokio::test]
+    async fn log_request_emits_s3_request_with_operation_name_on_success() {
+        let _ = log_request("test-user", Ok(S3Operation::ListBuckets)).await;
+        assert!(logs_contain("s3_request"));
+        assert!(logs_contain("ListBuckets"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn log_request_emits_s3_request_with_operation_name_on_dispatch_error() {
+        let op = S3Operation::CreateBucket {
+            bucket: "b".to_string(),
+        };
+        let _ = log_request("test-user", Ok(op)).await;
+        assert!(logs_contain("s3_request"));
+        assert!(logs_contain("CreateBucket"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn log_request_emits_s3_request_without_an_operation_name_on_parse_error() {
+        let _ = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        assert!(logs_contain("s3_request"));
+        // `operation` is `Option<&str>`; tracing's blanket `Value` impl for
+        // `Option<T>` skips the visitor entirely when the value is `None`, so
+        // the field should not appear in the log output at all — not even as
+        // an empty or null value. Checked as "operation=" (its rendered
+        // key=value form), not the bare word "operation", since this test's
+        // own name is included in the captured output as a span name and
+        // would otherwise trivially match a plain substring check.
+        assert!(!logs_contain("operation="));
+    }
+
+    /// A `MakeWriter` that clones share the same underlying buffer, so a test
+    /// can hand a writer to a subscriber while keeping a handle to read back
+    /// whatever it wrote.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `log_request` under a subscriber built with our actual production
+    /// formatter config (`.json().with_current_span(false)`, same as
+    /// `init()`), captures its output, and returns the JSON object for the
+    /// `s3_request` event. Unlike `#[traced_test]` (which uses its own
+    /// text-based formatter), this exercises the exact JSON shape `init()`
+    /// configures — the level `tracing-test`'s `logs_contain` can't reach.
+    async fn s3_request_json(user: &str, parsed: Result<S3Operation, S3Error>) -> serde_json::Value {
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_writer(buffer.clone())
+            .finish();
+
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let _ = log_request(user, parsed).await;
+        }
+
+        let captured = buffer.0.lock().unwrap();
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("each log line should be valid JSON"))
+            .find(|line| line["fields"]["message"] == "s3_request")
+            .expect("s3_request event should have been logged")
+    }
+
+    #[tokio::test]
+    async fn s3_request_event_serializes_numeric_fields_as_json_numbers() {
+        let event = s3_request_json("test-user", Ok(S3Operation::ListBuckets)).await;
+
+        assert!(
+            event["fields"]["duration_ms"].is_number(),
+            "duration_ms should serialize as a JSON number, not a string: {event}"
+        );
+        assert!(
+            event["fields"]["bytes"].is_number(),
+            "bytes should serialize as a JSON number: {event}"
+        );
+        assert!(
+            event["fields"]["status"].is_number(),
+            "status should serialize as a JSON number: {event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_request_event_omits_operation_field_on_parse_error() {
+        let event = s3_request_json("test-user", Err(S3Error::MethodNotAllowed)).await;
+
+        assert!(
+            event["fields"].get("operation").is_none(),
+            "operation field should be omitted entirely for parse errors: {event}"
+        );
     }
 }
