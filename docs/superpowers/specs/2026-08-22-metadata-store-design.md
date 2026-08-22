@@ -38,7 +38,7 @@ pub struct Metadata {
 
 ### Supporting types (`src/metadata/types.rs`)
 
-- `Etag(String)`, `CacheControl(String)`, `ContentType(String)` — thin newtypes around the raw wire value. No parsing/validation in this cut.
+- `Etag(Bytes)` — thin newtype around the raw ETag bytes (not required to be UTF-8). `CacheControl(String)`, `ContentType(String)` — thin newtypes around the raw wire value. No parsing/validation in this cut.
 - `ObjectVersion(String)` — opaque version identifier. Carries one named constructor beyond a plain wrapper: `ObjectVersion::unversioned()`, returning the literal string `"null"` — this is AWS's own convention (`GetObject` on an object from a bucket that was never version-enabled reports `VersionId: "null"`), reused here as the sentinel that marks a row as belonging to an unversioned bucket.
 - `ObjectStorageClass` — enum matching AWS's full storage class set (`Standard`, `ReducedRedundancy`, `StandardIa`, `OnezoneIa`, `IntelligentTiering`, `Glacier`, `DeepArchive`, `Outposts`, `GlacierIr`, `ExpressOnezone`); `Default` → `Standard`.
 - `DataEncryptionContext` — empty placeholder struct (zero fields) until a real encryption backend exists.
@@ -105,7 +105,7 @@ One table, `object_metadata`:
 | `bucket` | `TEXT NOT NULL` | |
 | `key` | `TEXT NOT NULL` | |
 | `version` | `TEXT NOT NULL` | `"null"` for unversioned rows |
-| `etag` | `TEXT NOT NULL` | |
+| `etag` | `BLOB NOT NULL` | |
 | `last_modified` | `INTEGER NOT NULL` | unix millis |
 | `size` | `INTEGER NOT NULL` | |
 | `cache_control` | `TEXT NOT NULL` | |
