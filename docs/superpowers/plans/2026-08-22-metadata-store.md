@@ -81,8 +81,8 @@ git commit -m "chore: add metadata store dependencies (sqlx, async-trait, serde)
 - Create: `src/metadata/types.rs`
 
 **Interfaces:**
-- Consumes: nothing beyond `std`/`serde`
-- Produces: `Etag(pub String)`, `CacheControl(pub String)`, `ContentType(pub String)`, `ObjectVersion(pub String)` (with `ObjectVersion::unversioned() -> Self`), `ObjectStorageClass` enum (with `as_str(&self) -> &'static str`, `parse(value: &str) -> Option<Self>`, `Display`, `Default` → `Standard`), `DataEncryptionContext` (empty struct, `Serialize`/`Deserialize`). All derive at least `Debug, Clone, PartialEq, Eq`. These are consumed by `Metadata` (Task 3) and the SQLite row mapping (Task 5).
+- Consumes: nothing beyond `std`/`serde`/`bytes`
+- Produces: `Etag(pub Bytes)`, `CacheControl(pub String)`, `ContentType(pub String)`, `ObjectVersion(pub String)` (with `ObjectVersion::unversioned() -> Self`), `ObjectStorageClass` enum (with `as_str(&self) -> &'static str`, `parse(value: &str) -> Option<Self>`, `Display`, `Default` → `Standard`), `DataEncryptionContext` (empty struct, `Serialize`/`Deserialize`). All derive at least `Debug, Clone, PartialEq, Eq`. These are consumed by `Metadata` (Task 3) and the SQLite row mapping (Task 5).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -154,8 +154,10 @@ Prepend this above the `#[cfg(test)]` block in `src/metadata/types.rs`:
 ```rust
 use std::fmt;
 
+use bytes::Bytes;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Etag(pub String);
+pub struct Etag(pub Bytes);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheControl(pub String);
@@ -277,13 +279,14 @@ Append this to `src/metadata/mod.rs` (a `#[cfg(test)] mod tests` block — this 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::time::SystemTime;
 
     #[test]
     fn metadata_constructs_with_all_fields() {
         let metadata = Metadata {
-            etag: Etag("\"abc123\"".to_string()),
+            etag: Etag(Bytes::from_static(b"\"abc123\"")),
             last_modified: SystemTime::now(),
             size: 42,
             cache_control: CacheControl("no-cache".to_string()),
@@ -439,7 +442,7 @@ CREATE TABLE object_metadata (
     bucket TEXT NOT NULL,
     key TEXT NOT NULL,
     version TEXT NOT NULL,
-    etag TEXT NOT NULL,
+    etag BLOB NOT NULL,
     last_modified INTEGER NOT NULL,
     size INTEGER NOT NULL,
     cache_control TEXT NOT NULL,
@@ -592,7 +595,7 @@ Add this to `src/metadata/sqlite/mod.rs`'s existing `#[cfg(test)] mod tests` blo
         .bind("my-bucket")
         .bind("my-key")
         .bind("v1")
-        .bind("\"abc123\"")
+        .bind(b"\"abc123\"".to_vec())
         .bind(1_700_000_000_000i64)
         .bind(42i64)
         .bind("no-cache")
@@ -621,7 +624,7 @@ Add this to `src/metadata/sqlite/mod.rs`'s existing `#[cfg(test)] mod tests` blo
         assert_eq!(metadata.bucket, "my-bucket");
         assert_eq!(metadata.key, "my-key");
         assert_eq!(metadata.version, ObjectVersion("v1".to_string()));
-        assert_eq!(metadata.etag, Etag("\"abc123\"".to_string()));
+        assert_eq!(metadata.etag, Etag(Bytes::from_static(b"\"abc123\"")));
         assert_eq!(metadata.size, 42);
         assert_eq!(
             metadata.content_type,
@@ -654,7 +657,7 @@ Add this to `src/metadata/sqlite/mod.rs`'s existing `#[cfg(test)] mod tests` blo
         .bind("b")
         .bind("k")
         .bind("v1")
-        .bind("etag")
+        .bind(b"etag".to_vec())
         .bind(0i64)
         .bind(0i64)
         .bind("")
@@ -757,7 +760,7 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, sqlx::Error> {
     let upload_id: Option<Vec<u8>> = row.try_get("upload_id")?;
 
     Ok(Metadata {
-        etag: Etag(row.try_get("etag")?),
+        etag: Etag(Bytes::from(row.try_get::<Vec<u8>, _>("etag")?)),
         last_modified: millis_to_system_time(row.try_get("last_modified")?),
         size: row.try_get::<i64, _>("size")? as usize,
         cache_control: CacheControl(row.try_get("cache_control")?),
@@ -813,7 +816,7 @@ Add these two `#[tokio::test]` functions to the existing `#[cfg(test)] mod tests
 ```rust
     fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadata {
         Metadata {
-            etag: Etag("\"etag\"".to_string()),
+            etag: Etag(Bytes::from_static(b"\"etag\"")),
             last_modified: SystemTime::now(),
             size: 10,
             cache_control: CacheControl("no-cache".to_string()),
@@ -972,7 +975,7 @@ where
     .bind(&metadata.bucket)
     .bind(&metadata.key)
     .bind(&metadata.version.0)
-    .bind(&metadata.etag.0)
+    .bind(metadata.etag.0.to_vec())
     .bind(system_time_to_millis(metadata.last_modified))
     .bind(metadata.size as i64)
     .bind(&metadata.cache_control.0)
@@ -1355,7 +1358,7 @@ Replace `delete_versioned`, `delete_specific_version`, and `delete_unversioned`'
         new_version: ObjectVersion,
     ) -> Result<(), MetadataError> {
         let marker = Metadata {
-            etag: Etag(String::new()),
+            etag: Etag(Bytes::new()),
             last_modified: SystemTime::now(),
             size: 0,
             cache_control: CacheControl(String::new()),
