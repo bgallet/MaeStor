@@ -92,7 +92,8 @@ Minimal for this cut — not-found is `Ok(None)` from `get`, not an error varian
 
 - `src/metadata/mod.rs` — `Metadata`, `MetadataStore`, `MetadataError`.
 - `src/metadata/types.rs` — the value types above.
-- `src/metadata/sqlite.rs` — `SqliteMetadataStore`, implementing `MetadataStore` over a `sqlx::SqlitePool`.
+- `src/metadata/sqlite/mod.rs` — `SqliteMetadataStore`, implementing `MetadataStore` over a `sqlx::SqlitePool`.
+- `src/metadata/sqlite/migrations/` — this backend's schema migrations (see below).
 
 ### Schema
 
@@ -120,7 +121,7 @@ One table, `object_metadata`:
 | `storage_class` | `TEXT NOT NULL` | enum's string form, e.g. `"STANDARD"` |
 | `encryption_context` | `TEXT NULL` | JSON |
 
-Constraints: `UNIQUE(bucket, key, version)` (the natural key both `put_*` methods upsert on), index on `(bucket, key, is_latest)` for latest-row lookups, index on `(bucket, key)` for `list_versions` scans.
+Constraints: `UNIQUE(bucket, key, version)` (the natural key both `put_*` methods upsert on) and an index on `(bucket, key, is_latest)` for latest-row lookups. No separate `(bucket, key)` index — it would be redundant with `(bucket, key, is_latest)`, whose leftmost prefix already serves `list_versions`' `(bucket, key)` scans.
 
 ### Dependencies
 
@@ -130,7 +131,7 @@ Constraints: `UNIQUE(bucket, key, version)` (the natural key both `put_*` method
 
 ### Migrations
 
-Schema lives in a `migrations/` directory at the crate root, applied via `sqlx::migrate!` when `SqliteMetadataStore` is constructed.
+Schema lives in `src/metadata/sqlite/migrations/`, applied via `sqlx::migrate!` when `SqliteMetadataStore` is constructed. Scoped under the SQLite implementation specifically, not a crate-root `migrations/` directory — a future non-SQLite (or non-SQL) backend will have its own schema-setup story, which shouldn't be implied to share this one.
 
 ### Testing
 
