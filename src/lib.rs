@@ -4,6 +4,7 @@ pub mod auth;
 pub mod routing;
 pub mod handlers;
 pub mod logging;
+pub mod metadata;
 
 use std::net::SocketAddr;
 use std::time::Duration;
