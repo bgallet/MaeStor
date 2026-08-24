@@ -204,11 +204,36 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn get(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version: Option<&ObjectVersion>,
+        bucket: &str,
+        key: &str,
+        version: Option<&ObjectVersion>,
     ) -> Result<Option<Metadata>, MetadataError> {
-        unimplemented!("implemented in Task 7")
+        let row = match version {
+            Some(version) => {
+                sqlx::query(
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?",
+                )
+                .bind(bucket)
+                .bind(key)
+                .bind(&version.0)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1",
+                )
+                .bind(bucket)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        }
+        .map_err(MetadataError::Backend)?;
+
+        row.map(|row| row_to_metadata(&row))
+            .transpose()
+            .map_err(MetadataError::Backend)
     }
 
     async fn delete_versioned(
@@ -465,5 +490,56 @@ mod tests {
         assert_eq!(metadata.version, ObjectVersion::unversioned());
         assert_eq!(metadata.size, 20);
         assert!(metadata.is_latest);
+    }
+
+    #[tokio::test]
+    async fn get_with_no_version_returns_the_latest_row() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("put should succeed");
+
+        let found = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("a row should be found");
+        assert_eq!(found.version, ObjectVersion("v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_with_a_specific_version_returns_that_version_even_if_not_latest() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("put should succeed");
+
+        let found = store
+            .get("b", "k", Some(&ObjectVersion("v1".to_string())))
+            .await
+            .expect("get should succeed")
+            .expect("a row should be found");
+        assert_eq!(found.version, ObjectVersion("v1".to_string()));
+        assert!(!found.is_latest);
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_a_key_that_was_never_written() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let found = store
+            .get("no-such-bucket", "no-such-key", None)
+            .await
+            .expect("get should succeed");
+        assert_eq!(found, None);
     }
 }
