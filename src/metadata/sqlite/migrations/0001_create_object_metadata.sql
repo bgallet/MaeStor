@@ -23,3 +23,8 @@ CREATE TABLE object_metadata (
 
 CREATE INDEX idx_object_metadata_bucket_key_is_latest
     ON object_metadata (bucket, key, is_latest);
+
+-- Defense in depth: at most one row per (bucket, key) may be the latest.
+CREATE UNIQUE INDEX idx_object_metadata_one_latest
+    ON object_metadata (bucket, key)
+    WHERE is_latest = 1;

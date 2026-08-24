@@ -33,13 +33,22 @@ pub struct Metadata {
 
 #[derive(Debug)]
 pub enum MetadataError {
+    /// The backend itself failed — unreachable database, I/O error, and so on.
+    /// Generally transient and retryable.
     Backend(sqlx::Error),
+    /// A stored value could not be interpreted, or a caller-supplied value
+    /// cannot be represented in storage. Not retryable — it means a bug or
+    /// out-of-band tampering, not a transient fault.
+    Corrupt { field: &'static str, detail: String },
 }
 
 impl std::fmt::Display for MetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataError::Backend(err) => write!(f, "metadata backend error: {err}"),
+            MetadataError::Corrupt { field, detail } => {
+                write!(f, "corrupt metadata field {field}: {detail}")
+            }
         }
     }
 }
@@ -115,5 +124,16 @@ mod tests {
     fn metadata_error_displays_the_backend_error() {
         let err = MetadataError::Backend(sqlx::Error::RowNotFound);
         assert!(format!("{err}").contains("metadata backend error"));
+    }
+
+    #[test]
+    fn metadata_error_displays_the_corrupt_field_and_detail() {
+        let err = MetadataError::Corrupt {
+            field: "storage_class",
+            detail: "unrecognized storage class \"NOPE\"".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("corrupt metadata field storage_class"), "{rendered}");
+        assert!(rendered.contains("unrecognized storage class"), "{rendered}");
     }
 }

@@ -17,8 +17,14 @@ pub struct SqliteMetadataStore {
 
 impl SqliteMetadataStore {
     /// Connects using the given options and applies any pending migrations.
-    /// Callers choose the options — e.g. `SqliteConnectOptions::new().filename(path).create_if_missing(true)`
-    /// for a real file-backed database.
+    ///
+    /// For a real file-backed database: `SqliteConnectOptions::new().filename(path).create_if_missing(true)`.
+    ///
+    /// If you pass in-memory options (`SqliteConnectOptions::new().in_memory(true)`),
+    /// be aware this constructor does not set `max_connections` — sqlx's pool default
+    /// (10) means each pooled connection would open its own separate, empty in-memory
+    /// database. For in-memory use, prefer a pool built with `max_connections(1)`
+    /// (see this module's test-only `connect_in_memory()` for the pattern).
     pub async fn connect(options: SqliteConnectOptions) -> Result<Self, MetadataError> {
         let pool = SqlitePoolOptions::new()
             .connect_with(options)
@@ -53,63 +59,106 @@ impl SqliteMetadataStore {
     }
 }
 
-fn system_time_to_millis(time: SystemTime) -> i64 {
+/// Encodes a caller-supplied `SystemTime` as epoch milliseconds. Pre-epoch
+/// times are not representable, and callers hand us times that ultimately come
+/// from request data, so this reports an error rather than panicking.
+fn system_time_to_millis(time: SystemTime, field: &'static str) -> Result<i64, MetadataError> {
     time.duration_since(UNIX_EPOCH)
-        .expect("system time should be after the unix epoch")
-        .as_millis() as i64
+        .map_err(|_| MetadataError::Corrupt {
+            field,
+            detail: "SystemTime is before the unix epoch".to_string(),
+        })
+        .map(|duration| duration.as_millis() as i64)
 }
 
 fn millis_to_system_time(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis as u64)
 }
 
-fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, sqlx::Error> {
-    let storage_class_text: String = row.try_get("storage_class")?;
-    let storage_class = ObjectStorageClass::parse(&storage_class_text).ok_or_else(|| {
-        sqlx::Error::ColumnDecode {
-            index: "storage_class".to_string(),
-            source: format!("unrecognized storage class {storage_class_text:?}").into(),
-        }
-    })?;
-
-    let user_metadata_json: String = row.try_get("user_metadata")?;
-    let user_metadata: HashMap<String, Bytes> =
-        serde_json::from_str(&user_metadata_json).map_err(|err| sqlx::Error::ColumnDecode {
-            index: "user_metadata".to_string(),
-            source: Box::new(err),
+fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
+    let storage_class_text: String = row
+        .try_get("storage_class")
+        .map_err(MetadataError::Backend)?;
+    let storage_class =
+        ObjectStorageClass::parse(&storage_class_text).ok_or_else(|| MetadataError::Corrupt {
+            field: "storage_class",
+            detail: format!("unrecognized storage class {storage_class_text:?}"),
         })?;
 
-    let encryption_context_json: Option<String> = row.try_get("encryption_context")?;
+    let user_metadata_json: String = row.try_get("user_metadata").map_err(MetadataError::Backend)?;
+    let user_metadata: HashMap<String, Bytes> = serde_json::from_str(&user_metadata_json)
+        .map_err(|err| MetadataError::Corrupt {
+            field: "user_metadata",
+            detail: err.to_string(),
+        })?;
+
+    let encryption_context_json: Option<String> = row
+        .try_get("encryption_context")
+        .map_err(MetadataError::Backend)?;
     let encryption_context = encryption_context_json
         .map(|json| serde_json::from_str::<DataEncryptionContext>(&json))
         .transpose()
-        .map_err(|err| sqlx::Error::ColumnDecode {
-            index: "encryption_context".to_string(),
-            source: Box::new(err),
+        .map_err(|err| MetadataError::Corrupt {
+            field: "encryption_context",
+            detail: err.to_string(),
         })?;
 
-    let upload_id: Option<Vec<u8>> = row.try_get("upload_id")?;
+    let upload_id: Option<Vec<u8>> = row.try_get("upload_id").map_err(MetadataError::Backend)?;
+
+    let size: usize = row
+        .try_get::<i64, _>("size")
+        .map_err(MetadataError::Backend)?
+        .try_into()
+        .map_err(|_| MetadataError::Corrupt {
+            field: "size",
+            detail: "stored size is negative".to_string(),
+        })?;
+    let backend_id: usize = row
+        .try_get::<i64, _>("backend_id")
+        .map_err(MetadataError::Backend)?
+        .try_into()
+        .map_err(|_| MetadataError::Corrupt {
+            field: "backend_id",
+            detail: "stored backend_id is negative".to_string(),
+        })?;
 
     Ok(Metadata {
-        etag: Etag(Bytes::from(row.try_get::<Vec<u8>, _>("etag")?)),
-        last_modified: millis_to_system_time(row.try_get("last_modified")?),
-        size: row.try_get::<i64, _>("size")? as usize,
-        cache_control: CacheControl(row.try_get("cache_control")?),
-        backend_id: row.try_get::<i64, _>("backend_id")? as usize,
-        bucket: row.try_get("bucket")?,
-        key: row.try_get("key")?,
+        etag: Etag(Bytes::from(
+            row.try_get::<Vec<u8>, _>("etag")
+                .map_err(MetadataError::Backend)?,
+        )),
+        last_modified: millis_to_system_time(
+            row.try_get("last_modified").map_err(MetadataError::Backend)?,
+        ),
+        size,
+        cache_control: CacheControl(row.try_get("cache_control").map_err(MetadataError::Backend)?),
+        backend_id,
+        bucket: row.try_get("bucket").map_err(MetadataError::Backend)?,
+        key: row.try_get("key").map_err(MetadataError::Backend)?,
         content_type: row
-            .try_get::<Option<String>, _>("content_type")?
+            .try_get::<Option<String>, _>("content_type")
+            .map_err(MetadataError::Backend)?
             .map(ContentType),
-        content_disposition: row.try_get("content_disposition")?,
-        content_language: row.try_get("content_language")?,
-        version: ObjectVersion(row.try_get("version")?),
+        content_disposition: row
+            .try_get("content_disposition")
+            .map_err(MetadataError::Backend)?,
+        content_language: row
+            .try_get("content_language")
+            .map_err(MetadataError::Backend)?,
+        version: ObjectVersion(row.try_get("version").map_err(MetadataError::Backend)?),
         cloned_at: row
-            .try_get::<Option<i64>, _>("cloned_at")?
+            .try_get::<Option<i64>, _>("cloned_at")
+            .map_err(MetadataError::Backend)?
             .map(millis_to_system_time),
         upload_id: upload_id.map(Bytes::from),
-        is_latest: row.try_get::<i64, _>("is_latest")? != 0,
-        delete_marker: row.try_get::<i64, _>("delete_marker")? != 0,
+        is_latest: row
+            .try_get::<i64, _>("is_latest")
+            .map_err(MetadataError::Backend)?
+            != 0,
+        delete_marker: row
+            .try_get::<i64, _>("delete_marker")
+            .map_err(MetadataError::Backend)?
+            != 0,
         user_metadata,
         storage_class,
         encryption_context,
@@ -125,6 +174,12 @@ where
     let encryption_context_json = metadata.encryption_context.as_ref().map(|ctx| {
         serde_json::to_string(ctx).expect("DataEncryptionContext should always serialize")
     });
+
+    let last_modified_millis = system_time_to_millis(metadata.last_modified, "last_modified")?;
+    let cloned_at_millis = metadata
+        .cloned_at
+        .map(|time| system_time_to_millis(time, "cloned_at"))
+        .transpose()?;
 
     sqlx::query(
         "INSERT INTO object_metadata
@@ -153,14 +208,14 @@ where
     .bind(&metadata.key)
     .bind(&metadata.version.0)
     .bind(metadata.etag.0.to_vec())
-    .bind(system_time_to_millis(metadata.last_modified))
+    .bind(last_modified_millis)
     .bind(metadata.size as i64)
     .bind(&metadata.cache_control.0)
     .bind(metadata.backend_id as i64)
     .bind(metadata.content_type.as_ref().map(|c| c.0.as_str()))
     .bind(metadata.content_disposition.as_deref())
     .bind(metadata.content_language.as_deref())
-    .bind(metadata.cloned_at.map(system_time_to_millis))
+    .bind(cloned_at_millis)
     .bind(metadata.upload_id.as_ref().map(|b| b.to_vec()))
     .bind(metadata.is_latest as i64)
     .bind(metadata.delete_marker as i64)
@@ -199,7 +254,26 @@ impl MetadataStore for SqliteMetadataStore {
         metadata.version = ObjectVersion::unversioned();
         metadata.is_latest = true;
 
-        upsert_row(&self.pool, &metadata).await
+        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
+
+        // Versioned rows may already exist for this key (a bucket whose
+        // versioning was suspended). Demote whichever of them is currently
+        // latest — but never the sentinel row itself, since the upsert below
+        // re-marks it latest anyway.
+        sqlx::query(
+            "UPDATE object_metadata SET is_latest = 0
+             WHERE bucket = ? AND key = ? AND is_latest = 1 AND version <> ?",
+        )
+        .bind(&metadata.bucket)
+        .bind(&metadata.key)
+        .bind(&metadata.version.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(MetadataError::Backend)?;
+
+        upsert_row(&mut *tx, &metadata).await?;
+
+        tx.commit().await.map_err(MetadataError::Backend)
     }
 
     async fn get(
@@ -231,9 +305,7 @@ impl MetadataStore for SqliteMetadataStore {
         }
         .map_err(MetadataError::Backend)?;
 
-        row.map(|row| row_to_metadata(&row))
-            .transpose()
-            .map_err(MetadataError::Backend)
+        row.map(|row| row_to_metadata(&row)).transpose()
     }
 
     async fn delete_versioned(
@@ -339,10 +411,7 @@ impl MetadataStore for SqliteMetadataStore {
         }
         .map_err(MetadataError::Backend)?;
 
-        rows.iter()
-            .map(row_to_metadata)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(MetadataError::Backend)
+        rows.iter().map(row_to_metadata).collect()
     }
 
     async fn list_versions(
@@ -353,7 +422,7 @@ impl MetadataStore for SqliteMetadataStore {
         let rows = match prefix {
             Some(prefix) => {
                 sqlx::query(
-                    "SELECT * FROM object_metadata WHERE bucket = ? AND key LIKE ? ESCAPE '\\' ORDER BY key, id",
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND key LIKE ? ESCAPE '\\' ORDER BY key, id DESC",
                 )
                 .bind(bucket)
                 .bind(like_prefix_pattern(prefix))
@@ -361,7 +430,7 @@ impl MetadataStore for SqliteMetadataStore {
                 .await
             }
             None => {
-                sqlx::query("SELECT * FROM object_metadata WHERE bucket = ? ORDER BY key, id")
+                sqlx::query("SELECT * FROM object_metadata WHERE bucket = ? ORDER BY key, id DESC")
                     .bind(bucket)
                     .fetch_all(&self.pool)
                     .await
@@ -369,10 +438,7 @@ impl MetadataStore for SqliteMetadataStore {
         }
         .map_err(MetadataError::Backend)?;
 
-        rows.iter()
-            .map(row_to_metadata)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(MetadataError::Backend)
+        rows.iter().map(row_to_metadata).collect()
     }
 
     async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
@@ -834,7 +900,8 @@ mod tests {
             .await
             .expect("list_versions should succeed");
         let version_ids: Vec<_> = versions.iter().map(|m| m.version.0.as_str()).collect();
-        assert_eq!(version_ids, vec!["v1", "marker1"]);
+        // Newest-first within a key, matching S3's ListObjectVersions.
+        assert_eq!(version_ids, vec!["marker1", "v1"]);
         assert!(versions.iter().any(|m| m.delete_marker));
     }
 
@@ -856,5 +923,123 @@ mod tests {
 
         let buckets = store.list_buckets().await.expect("list_buckets should succeed");
         assert_eq!(buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn put_unversioned_demotes_existing_versioned_latest_rows() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("put should succeed");
+
+        store
+            .put_unversioned(sample_metadata("b", "k", "ignored"))
+            .await
+            .expect("put_unversioned should succeed");
+
+        let latest = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("a latest row should be found");
+        assert_eq!(latest.version, ObjectVersion::unversioned());
+
+        let listed = store.list("b", None).await.expect("list should succeed");
+        let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["k"]);
+
+        // All three rows are still on disk; only the flag moved.
+        assert_eq!(row_count(&store, "b", "k").await, 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_put_unversioned_keeps_the_sentinel_row_latest() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_unversioned(sample_metadata("b", "k", "ignored"))
+            .await
+            .expect("first put should succeed");
+        store
+            .put_unversioned(sample_metadata("b", "k", "ignored"))
+            .await
+            .expect("second put should succeed");
+
+        let latest = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("the sentinel row should still be latest");
+        assert_eq!(latest.version, ObjectVersion::unversioned());
+        assert!(latest.is_latest);
+    }
+
+    #[tokio::test]
+    async fn put_rejects_a_pre_epoch_last_modified_instead_of_panicking() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let mut metadata = sample_metadata("b", "k", "v1");
+        metadata.last_modified = UNIX_EPOCH - Duration::from_secs(60);
+
+        let err = store
+            .put_versioned(metadata)
+            .await
+            .expect_err("a pre-epoch timestamp should be rejected");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "last_modified", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_rejects_a_pre_epoch_cloned_at_instead_of_panicking() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let mut metadata = sample_metadata("b", "k", "v1");
+        metadata.cloned_at = Some(UNIX_EPOCH - Duration::from_secs(60));
+
+        let err = store
+            .put_versioned(metadata)
+            .await
+            .expect_err("a pre-epoch timestamp should be rejected");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "cloned_at", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_metadata_and_encryption_context_round_trip() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+
+        let mut metadata = sample_metadata("b", "k", "v1");
+        metadata.user_metadata = HashMap::from([
+            ("k".to_string(), Bytes::from_static(&[0xff, 0x00, b'h', b'i'])),
+            ("plain".to_string(), Bytes::from_static(b"value")),
+        ]);
+        metadata.encryption_context = Some(DataEncryptionContext);
+        let expected_user_metadata = metadata.user_metadata.clone();
+
+        store
+            .put_versioned(metadata)
+            .await
+            .expect("put should succeed");
+
+        let found = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("a row should be found");
+        assert_eq!(found.user_metadata, expected_user_metadata);
+        assert_eq!(found.encryption_context, Some(DataEncryptionContext));
+    }
+
+    #[tokio::test]
+    async fn metadata_store_is_object_safe() {
+        let store: std::sync::Arc<dyn MetadataStore> =
+            std::sync::Arc::new(SqliteMetadataStore::connect_in_memory().await);
+        let _ = store.list_buckets().await;
     }
 }
