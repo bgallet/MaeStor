@@ -317,25 +317,84 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
-    async fn list(
-        &self,
-        _bucket: &str,
-        _prefix: Option<&str>,
-    ) -> Result<Vec<Metadata>, MetadataError> {
-        unimplemented!("implemented in Task 9")
+    async fn list(&self, bucket: &str, prefix: Option<&str>) -> Result<Vec<Metadata>, MetadataError> {
+        let rows = match prefix {
+            Some(prefix) => {
+                sqlx::query(
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND is_latest = 1 AND key LIKE ? ESCAPE '\\' ORDER BY key",
+                )
+                .bind(bucket)
+                .bind(like_prefix_pattern(prefix))
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND is_latest = 1 ORDER BY key",
+                )
+                .bind(bucket)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(MetadataError::Backend)?;
+
+        rows.iter()
+            .map(row_to_metadata)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(MetadataError::Backend)
     }
 
     async fn list_versions(
         &self,
-        _bucket: &str,
-        _prefix: Option<&str>,
+        bucket: &str,
+        prefix: Option<&str>,
     ) -> Result<Vec<Metadata>, MetadataError> {
-        unimplemented!("implemented in Task 9")
+        let rows = match prefix {
+            Some(prefix) => {
+                sqlx::query(
+                    "SELECT * FROM object_metadata WHERE bucket = ? AND key LIKE ? ESCAPE '\\' ORDER BY key, id",
+                )
+                .bind(bucket)
+                .bind(like_prefix_pattern(prefix))
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query("SELECT * FROM object_metadata WHERE bucket = ? ORDER BY key, id")
+                    .bind(bucket)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+        }
+        .map_err(MetadataError::Backend)?;
+
+        rows.iter()
+            .map(row_to_metadata)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(MetadataError::Backend)
     }
 
     async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
-        unimplemented!("implemented in Task 9")
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT bucket FROM object_metadata ORDER BY bucket")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(MetadataError::Backend)?;
+
+        Ok(rows.into_iter().map(|(bucket,)| bucket).collect())
     }
+}
+
+/// Escapes `%`/`_`/`\` in a caller-supplied prefix so `LIKE ... ESCAPE '\'`
+/// matches only literal text — without this, a key that happens to contain
+/// `%` or `_` would have those characters misread as SQL wildcards.
+fn like_prefix_pattern(prefix: &str) -> String {
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{escaped}%")
 }
 
 #[cfg(test)]
@@ -701,5 +760,101 @@ mod tests {
             .await
             .expect("get should succeed");
         assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn list_returns_latest_rows_for_a_bucket() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store.put_versioned(sample_metadata("b", "a", "v1")).await.expect("put should succeed");
+        store.put_versioned(sample_metadata("b", "a", "v2")).await.expect("put should succeed");
+        store.put_versioned(sample_metadata("b", "c", "v1")).await.expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("other-bucket", "a", "v1"))
+            .await
+            .expect("put should succeed");
+
+        let listed = store.list("b", None).await.expect("list should succeed");
+        assert_eq!(listed.len(), 2);
+        let versions: Vec<_> = listed.iter().map(|m| m.version.0.as_str()).collect();
+        assert_eq!(versions, vec!["v2", "v1"]);
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_prefix() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "docs/a", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "docs/b", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "images/c", "v1"))
+            .await
+            .expect("put should succeed");
+
+        let listed = store.list("b", Some("docs/")).await.expect("list should succeed");
+        let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["docs/a", "docs/b"]);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_does_not_treat_percent_or_underscore_as_wildcards() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "100%_off", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "100X_off", "v1"))
+            .await
+            .expect("put should succeed");
+
+        let listed = store.list("b", Some("100%")).await.expect("list should succeed");
+        let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["100%_off"]);
+    }
+
+    #[tokio::test]
+    async fn list_versions_returns_every_version_including_markers() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .delete_versioned("b", "k", ObjectVersion("marker1".to_string()))
+            .await
+            .expect("delete should succeed");
+
+        let versions = store
+            .list_versions("b", None)
+            .await
+            .expect("list_versions should succeed");
+        let version_ids: Vec<_> = versions.iter().map(|m| m.version.0.as_str()).collect();
+        assert_eq!(version_ids, vec!["v1", "marker1"]);
+        assert!(versions.iter().any(|m| m.delete_marker));
+    }
+
+    #[tokio::test]
+    async fn list_buckets_returns_distinct_bucket_names() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("bucket-b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("bucket-a", "k1", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("bucket-a", "k2", "v1"))
+            .await
+            .expect("put should succeed");
+
+        let buckets = store.list_buckets().await.expect("list_buckets should succeed");
+        assert_eq!(buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
     }
 }
