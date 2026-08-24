@@ -238,24 +238,83 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_versioned(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _new_version: ObjectVersion,
+        bucket: &str,
+        key: &str,
+        new_version: ObjectVersion,
     ) -> Result<(), MetadataError> {
-        unimplemented!("implemented in Task 8")
+        let marker = Metadata {
+            etag: Etag(Bytes::new()),
+            last_modified: SystemTime::now(),
+            size: 0,
+            cache_control: CacheControl(String::new()),
+            backend_id: 0,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_type: None,
+            content_disposition: None,
+            content_language: None,
+            version: new_version,
+            cloned_at: None,
+            upload_id: None,
+            is_latest: true,
+            delete_marker: true,
+            user_metadata: HashMap::new(),
+            storage_class: ObjectStorageClass::Standard,
+            encryption_context: None,
+        };
+
+        self.put_versioned(marker).await
     }
 
     async fn delete_specific_version(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version: &ObjectVersion,
+        bucket: &str,
+        key: &str,
+        version: &ObjectVersion,
     ) -> Result<(), MetadataError> {
-        unimplemented!("implemented in Task 8")
+        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
+
+        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
+            .bind(bucket)
+            .bind(key)
+            .bind(&version.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(MetadataError::Backend)?;
+
+        // If that was the latest row, promote the next-most-recent remaining
+        // row (by insertion order) — a no-op if some other row is already
+        // latest, since only the deleted row could have held that flag.
+        sqlx::query(
+            "UPDATE object_metadata SET is_latest = 1
+             WHERE id = (
+                 SELECT id FROM object_metadata WHERE bucket = ? AND key = ? ORDER BY id DESC LIMIT 1
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1
+             )",
+        )
+        .bind(bucket)
+        .bind(key)
+        .bind(bucket)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(MetadataError::Backend)?;
+
+        tx.commit().await.map_err(MetadataError::Backend)
     }
 
-    async fn delete_unversioned(&self, _bucket: &str, _key: &str) -> Result<(), MetadataError> {
-        unimplemented!("implemented in Task 8")
+    async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
+        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
+            .bind(bucket)
+            .bind(key)
+            .bind(&ObjectVersion::unversioned().0)
+            .execute(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+
+        Ok(())
     }
 
     async fn list(
@@ -538,6 +597,107 @@ mod tests {
         let store = SqliteMetadataStore::connect_in_memory().await;
         let found = store
             .get("no-such-bucket", "no-such-key", None)
+            .await
+            .expect("get should succeed");
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn delete_versioned_creates_a_marker_as_the_new_latest() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+
+        store
+            .delete_versioned("b", "k", ObjectVersion("marker1".to_string()))
+            .await
+            .expect("delete_versioned should succeed");
+
+        let latest = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("a row should be found");
+        assert_eq!(latest.version, ObjectVersion("marker1".to_string()));
+        assert!(latest.delete_marker);
+
+        let original = store
+            .get("b", "k", Some(&ObjectVersion("v1".to_string())))
+            .await
+            .expect("get should succeed")
+            .expect("original version should still exist");
+        assert!(!original.delete_marker);
+    }
+
+    #[tokio::test]
+    async fn delete_specific_version_removes_only_that_row() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("put should succeed");
+
+        store
+            .delete_specific_version("b", "k", &ObjectVersion("v1".to_string()))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(row_count(&store, "b", "k").await, 1);
+        let latest = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("a row should be found");
+        assert_eq!(latest.version, ObjectVersion("v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_specific_version_promotes_the_next_latest_when_the_latest_is_removed() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("put should succeed");
+
+        store
+            .delete_specific_version("b", "k", &ObjectVersion("v2".to_string()))
+            .await
+            .expect("delete should succeed");
+
+        let latest = store
+            .get("b", "k", None)
+            .await
+            .expect("get should succeed")
+            .expect("v1 should have been promoted to latest");
+        assert_eq!(latest.version, ObjectVersion("v1".to_string()));
+        assert!(latest.is_latest);
+    }
+
+    #[tokio::test]
+    async fn delete_unversioned_removes_the_sentinel_row() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store
+            .put_unversioned(sample_metadata("b", "k", "ignored"))
+            .await
+            .expect("put should succeed");
+
+        store
+            .delete_unversioned("b", "k")
+            .await
+            .expect("delete should succeed");
+
+        let found = store
+            .get("b", "k", None)
             .await
             .expect("get should succeed");
         assert_eq!(found, None);
