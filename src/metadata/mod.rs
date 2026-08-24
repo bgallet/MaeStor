@@ -1,3 +1,4 @@
+pub mod sqlite;
 pub mod types;
 
 use std::collections::HashMap;
