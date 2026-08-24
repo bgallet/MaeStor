@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, Metadata, MetadataError,
+    CacheControl, ContentType, DataEncryptionContext, Etag, Metadata, MetadataError, MetadataStore,
     ObjectStorageClass, ObjectVersion,
 };
 
@@ -115,11 +116,152 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, sqlx::Error> {
     })
 }
 
+async fn upsert_row<'e, E>(executor: E, metadata: &Metadata) -> Result<(), MetadataError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let user_metadata_json = serde_json::to_string(&metadata.user_metadata)
+        .expect("HashMap<String, Bytes> should always serialize");
+    let encryption_context_json = metadata.encryption_context.as_ref().map(|ctx| {
+        serde_json::to_string(ctx).expect("DataEncryptionContext should always serialize")
+    });
+
+    sqlx::query(
+        "INSERT INTO object_metadata
+         (bucket, key, version, etag, last_modified, size, cache_control, backend_id,
+          content_type, content_disposition, content_language, cloned_at, upload_id,
+          is_latest, delete_marker, user_metadata, storage_class, encryption_context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (bucket, key, version) DO UPDATE SET
+            etag = excluded.etag,
+            last_modified = excluded.last_modified,
+            size = excluded.size,
+            cache_control = excluded.cache_control,
+            backend_id = excluded.backend_id,
+            content_type = excluded.content_type,
+            content_disposition = excluded.content_disposition,
+            content_language = excluded.content_language,
+            cloned_at = excluded.cloned_at,
+            upload_id = excluded.upload_id,
+            is_latest = excluded.is_latest,
+            delete_marker = excluded.delete_marker,
+            user_metadata = excluded.user_metadata,
+            storage_class = excluded.storage_class,
+            encryption_context = excluded.encryption_context",
+    )
+    .bind(&metadata.bucket)
+    .bind(&metadata.key)
+    .bind(&metadata.version.0)
+    .bind(metadata.etag.0.to_vec())
+    .bind(system_time_to_millis(metadata.last_modified))
+    .bind(metadata.size as i64)
+    .bind(&metadata.cache_control.0)
+    .bind(metadata.backend_id as i64)
+    .bind(metadata.content_type.as_ref().map(|c| c.0.as_str()))
+    .bind(metadata.content_disposition.as_deref())
+    .bind(metadata.content_language.as_deref())
+    .bind(metadata.cloned_at.map(system_time_to_millis))
+    .bind(metadata.upload_id.as_ref().map(|b| b.to_vec()))
+    .bind(metadata.is_latest as i64)
+    .bind(metadata.delete_marker as i64)
+    .bind(user_metadata_json)
+    .bind(metadata.storage_class.as_str())
+    .bind(encryption_context_json)
+    .execute(executor)
+    .await
+    .map_err(MetadataError::Backend)?;
+
+    Ok(())
+}
+
+#[async_trait]
+impl MetadataStore for SqliteMetadataStore {
+    async fn put_versioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
+        metadata.is_latest = true;
+
+        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
+
+        sqlx::query(
+            "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
+        )
+        .bind(&metadata.bucket)
+        .bind(&metadata.key)
+        .execute(&mut *tx)
+        .await
+        .map_err(MetadataError::Backend)?;
+
+        upsert_row(&mut *tx, &metadata).await?;
+
+        tx.commit().await.map_err(MetadataError::Backend)
+    }
+
+    async fn put_unversioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
+        metadata.version = ObjectVersion::unversioned();
+        metadata.is_latest = true;
+
+        upsert_row(&self.pool, &metadata).await
+    }
+
+    async fn get(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version: Option<&ObjectVersion>,
+    ) -> Result<Option<Metadata>, MetadataError> {
+        unimplemented!("implemented in Task 7")
+    }
+
+    async fn delete_versioned(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _new_version: ObjectVersion,
+    ) -> Result<(), MetadataError> {
+        unimplemented!("implemented in Task 8")
+    }
+
+    async fn delete_specific_version(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version: &ObjectVersion,
+    ) -> Result<(), MetadataError> {
+        unimplemented!("implemented in Task 8")
+    }
+
+    async fn delete_unversioned(&self, _bucket: &str, _key: &str) -> Result<(), MetadataError> {
+        unimplemented!("implemented in Task 8")
+    }
+
+    async fn list(
+        &self,
+        _bucket: &str,
+        _prefix: Option<&str>,
+    ) -> Result<Vec<Metadata>, MetadataError> {
+        unimplemented!("implemented in Task 9")
+    }
+
+    async fn list_versions(
+        &self,
+        _bucket: &str,
+        _prefix: Option<&str>,
+    ) -> Result<Vec<Metadata>, MetadataError> {
+        unimplemented!("implemented in Task 9")
+    }
+
+    async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
+        unimplemented!("implemented in Task 9")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::Metadata;
     use crate::metadata::{CacheControl, ContentType, Etag, ObjectStorageClass, ObjectVersion};
     use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
 
     #[tokio::test]
     async fn connect_in_memory_creates_the_object_metadata_table() {
@@ -234,5 +376,94 @@ mod tests {
             .expect("row should be found");
 
         assert!(row_to_metadata(&row).is_err());
+    }
+
+    fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadata {
+        Metadata {
+            etag: Etag(Bytes::from_static(b"\"etag\"")),
+            last_modified: SystemTime::now(),
+            size: 10,
+            cache_control: CacheControl("no-cache".to_string()),
+            backend_id: 1,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_type: Some(ContentType("text/plain".to_string())),
+            content_disposition: None,
+            content_language: None,
+            version: ObjectVersion(version.to_string()),
+            cloned_at: None,
+            upload_id: None,
+            is_latest: false,
+            delete_marker: false,
+            user_metadata: HashMap::new(),
+            storage_class: ObjectStorageClass::Standard,
+            encryption_context: None,
+        }
+    }
+
+    async fn row_count(store: &SqliteMetadataStore, bucket: &str, key: &str) -> i64 {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM object_metadata WHERE bucket = ? AND key = ?")
+                .bind(bucket)
+                .bind(key)
+                .fetch_one(&store.pool)
+                .await
+                .expect("count query should succeed");
+        count
+    }
+
+    #[tokio::test]
+    async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+
+        store
+            .put_versioned(sample_metadata("b", "k", "v1"))
+            .await
+            .expect("first put should succeed");
+        store
+            .put_versioned(sample_metadata("b", "k", "v2"))
+            .await
+            .expect("second put should succeed");
+
+        assert_eq!(row_count(&store, "b", "k").await, 2);
+
+        let row = sqlx::query(
+            "SELECT * FROM object_metadata WHERE bucket = 'b' AND key = 'k' AND is_latest = 1",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("exactly one latest row should exist");
+        let latest = row_to_metadata(&row).expect("row should decode");
+        assert_eq!(latest.version, ObjectVersion("v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn put_unversioned_upserts_a_single_row() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+
+        let mut first = sample_metadata("b", "k", "ignored");
+        first.size = 10;
+        store
+            .put_unversioned(first)
+            .await
+            .expect("first put should succeed");
+
+        let mut second = sample_metadata("b", "k", "also-ignored");
+        second.size = 20;
+        store
+            .put_unversioned(second)
+            .await
+            .expect("second put should succeed");
+
+        assert_eq!(row_count(&store, "b", "k").await, 1);
+
+        let row = sqlx::query("SELECT * FROM object_metadata WHERE bucket = 'b' AND key = 'k'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+        let metadata = row_to_metadata(&row).expect("row should decode");
+        assert_eq!(metadata.version, ObjectVersion::unversioned());
+        assert_eq!(metadata.size, 20);
+        assert!(metadata.is_latest);
     }
 }
