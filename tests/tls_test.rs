@@ -79,3 +79,104 @@ async fn chain_file_sends_the_full_chain_to_the_client() {
     let chain = connection.peer_certificates().expect("client should observe the server's chain");
     assert_eq!(chain.len(), 2, "leaf + CA should both be sent");
 }
+
+fn client_config_with_cert(ca_pem: &str, cert_pem: &str, key_pem: &str) -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    let mut ca_reader = ca_pem.as_bytes();
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        roots.add(cert.expect("valid CA cert")).expect("add CA to root store");
+    }
+    let mut cert_reader = cert_pem.as_bytes();
+    let client_chain: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<_, _>>()
+        .expect("valid client cert");
+    let mut key_reader = key_pem.as_bytes();
+    let client_key = rustls_pemfile::private_key(&mut key_reader)
+        .expect("read client key")
+        .expect("client key present");
+
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_chain, client_key)
+        .expect("valid client auth cert")
+}
+
+#[tokio::test]
+async fn mtls_optional_accepts_connection_without_client_cert() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let server_config = load_server_config(&TlsConfig {
+        cert_chain_path: chain_path,
+        private_key_path: key_path,
+        client_ca_path: Some(client_ca_path),
+    })
+    .expect("load server config");
+
+    handshake_ok(Arc::new(server_config), client_config_trusting(&ca_pem), "bucket.s3.test").await;
+}
+
+#[tokio::test]
+async fn mtls_accepts_a_client_cert_signed_by_the_configured_ca() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let client_cert = support::issue_client_cert(&issuer, "alice@example.com");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let server_config = load_server_config(&TlsConfig {
+        cert_chain_path: chain_path,
+        private_key_path: key_path,
+        client_ca_path: Some(client_ca_path),
+    })
+    .expect("load server config");
+
+    let client_config = client_config_with_cert(&ca_pem, &client_cert.cert_pem, &client_cert.key_pem);
+    handshake_ok(Arc::new(server_config), client_config, "bucket.s3.test").await;
+}
+
+#[tokio::test]
+async fn mtls_rejects_a_client_cert_signed_by_an_untrusted_ca() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let (_other_ca_pem, other_ca_params, other_ca_key) = support::generate_ca();
+    let other_issuer = Issuer::from_params(&other_ca_params, other_ca_key);
+    let untrusted_client_cert = support::issue_client_cert(&other_issuer, "mallory@example.com");
+
+    let server_config = load_server_config(&TlsConfig {
+        cert_chain_path: chain_path,
+        private_key_path: key_path,
+        client_ca_path: Some(client_ca_path),
+    })
+    .expect("load server config");
+
+    // The client trusts the *real* server CA (`ca_pem`) so that a handshake
+    // failure here can only be attributed to the server's mTLS verifier
+    // rejecting the client's certificate — not to the client failing to
+    // trust the server.
+    let client_config = client_config_with_cert(
+        &ca_pem,
+        &untrusted_client_cert.cert_pem,
+        &untrusted_client_cert.key_pem,
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
+
+    let (server_result, _client_result) =
+        tokio::join!(acceptor.accept(server_io), connector.connect(name, client_io));
+    assert!(server_result.is_err(), "handshake should fail for an untrusted client cert");
+}

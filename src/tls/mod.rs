@@ -18,6 +18,7 @@ pub enum TlsError {
     NoCertificates,
     NoPrivateKey,
     Rustls(rustls::Error),
+    ClientVerifier(rustls::server::VerifierBuilderError),
 }
 
 impl std::fmt::Display for TlsError {
@@ -27,6 +28,7 @@ impl std::fmt::Display for TlsError {
             TlsError::NoCertificates => write!(f, "no certificates found in chain file"),
             TlsError::NoPrivateKey => write!(f, "no private key found in key file"),
             TlsError::Rustls(err) => write!(f, "TLS configuration error: {err}"),
+            TlsError::ClientVerifier(err) => write!(f, "client certificate verifier error: {err}"),
         }
     }
 }
@@ -42,6 +44,12 @@ impl From<io::Error> for TlsError {
 impl From<rustls::Error> for TlsError {
     fn from(err: rustls::Error) -> Self {
         TlsError::Rustls(err)
+    }
+}
+
+impl From<rustls::server::VerifierBuilderError> for TlsError {
+    fn from(err: rustls::server::VerifierBuilderError) -> Self {
+        TlsError::ClientVerifier(err)
     }
 }
 
@@ -75,7 +83,22 @@ pub fn load_server_config(config: &TlsConfig) -> Result<ServerConfig, TlsError> 
     let chain = load_cert_chain(&config.cert_chain_path)?;
     let key = load_private_key(&config.private_key_path)?;
 
-    let builder = ServerConfig::builder().with_no_client_auth();
+    let builder = ServerConfig::builder();
+    let builder = match &config.client_ca_path {
+        Some(client_ca_path) => {
+            let ca_certs = load_cert_chain(client_ca_path)?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                roots.add(cert)?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+                .allow_unauthenticated()
+                .build()?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+
     Ok(builder.with_single_cert(chain, key)?)
 }
 

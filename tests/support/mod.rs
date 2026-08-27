@@ -47,6 +47,17 @@ pub fn write_chain_and_key(dir: &Path, ca_cert_pem: &str, leaf: &GeneratedCert) 
     (chain_path, key_path)
 }
 
+/// A client certificate signed by `issuer`, with an email (rfc822Name) SAN.
+pub fn issue_client_cert(issuer: &Issuer<'_, KeyPair>, email: &str) -> GeneratedCert {
+    let key = KeyPair::generate().expect("generate client key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    params.subject_alt_names = vec![SanType::Rfc822Name(
+        Ia5String::try_from(email).expect("valid IA5 email"),
+    )];
+    let cert = params.signed_by(&key, issuer).expect("sign client cert");
+    GeneratedCert { cert_pem: cert.pem(), key_pem: key.serialize_pem() }
+}
+
 pub fn write_pem(dir: &Path, filename: &str, pem: &str) -> PathBuf {
     let path = dir.join(filename);
     std::fs::write(&path, pem).expect("write PEM file");
