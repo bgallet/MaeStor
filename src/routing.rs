@@ -60,8 +60,16 @@ pub fn parse_request(
 /// lowercased first so configuration and headers can differ in case. A bare
 /// `base_domain` (no bucket label) or a `Host` that doesn't match falls
 /// through to path-style routing.
+///
+/// A real `Host` header carries a `:port` suffix whenever the connection
+/// isn't on the scheme's default port (true of essentially every non-default
+/// deployment, including this project's own default bind of
+/// `127.0.0.1:8080`), so that suffix is stripped first via [`strip_host_port`].
+/// A trailing FQDN dot (`"mybucket.s3.test."`) is also stripped before
+/// matching.
 fn resolve_virtual_hosted_bucket(host: Option<&str>, base_domain: Option<&str>) -> Option<String> {
-    let host = host?.to_ascii_lowercase();
+    let host = strip_host_port(host?);
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     let base_domain = base_domain?.to_ascii_lowercase();
     let suffix = format!(".{base_domain}");
     let bucket = host.strip_suffix(&suffix)?;
@@ -69,6 +77,23 @@ fn resolve_virtual_hosted_bucket(host: Option<&str>, base_domain: Option<&str>) 
         None
     } else {
         Some(bucket.to_string())
+    }
+}
+
+/// Strips a trailing `:port` from a `Host` header value.
+///
+/// Careful with IPv6 literals, which are themselves colon-delimited: in a
+/// `Host` header an IPv6 literal must be bracketed (e.g. `[::1]` or
+/// `[::1]:8080`), so a colon only marks a port boundary when it appears after
+/// a closing `]` — or when there's no `[`/`]` in the host at all (the common
+/// hostname/IPv4 case, which has at most one colon: the port separator).
+fn strip_host_port(host: &str) -> &str {
+    match (host.find('['), host.rfind(']')) {
+        (Some(_), Some(bracket_end)) => host[bracket_end..]
+            .find(':')
+            .map(|offset| &host[..bracket_end + offset])
+            .unwrap_or(host),
+        _ => host.rfind(':').map(|i| &host[..i]).unwrap_or(host),
     }
 }
 
@@ -717,5 +742,60 @@ mod tests {
             Some("S3.Test"),
         );
         assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "mybucket".to_string() }));
+    }
+
+    #[test]
+    fn host_header_with_port_resolves_the_same_bucket_as_without_it() {
+        let empty = HeaderMap::new();
+        let with_port = parse_request(
+            &Method::GET,
+            "/",
+            None,
+            &empty,
+            Some("mybucket.s3.test:9000"),
+            Some("s3.test"),
+        );
+        let without_port = parse_request(
+            &Method::GET,
+            "/",
+            None,
+            &empty,
+            Some("mybucket.s3.test"),
+            Some("s3.test"),
+        );
+        assert_eq!(with_port, Ok(S3Operation::ListObjects { bucket: "mybucket".to_string() }));
+        assert_eq!(with_port, without_port);
+    }
+
+    #[test]
+    fn host_header_with_trailing_fqdn_dot_still_resolves_bucket() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/",
+            None,
+            &empty,
+            Some("mybucket.s3.test."),
+            Some("s3.test"),
+        );
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "mybucket".to_string() }));
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_with_port_does_not_falsely_match_base_domain() {
+        let empty = HeaderMap::new();
+        // Regression guard for the port-stripping logic: an IPv6 literal has
+        // its own colons, so a naive "strip after the last colon" would chop
+        // into the address itself rather than just the port. Neither should
+        // match a base domain that isn't a suffix of the address.
+        let result = parse_request(
+            &Method::GET,
+            "/my-bucket",
+            None,
+            &empty,
+            Some("[::1]:9000"),
+            Some("s3.test"),
+        );
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "my-bucket".to_string() }));
     }
 }
