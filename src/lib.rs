@@ -29,16 +29,20 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn handle_request(
     req: Request<Incoming>,
+    routing_config: &routing::RoutingConfig,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // Borrow directly from `req` rather than cloning method/path/query/headers
     // up front — nothing here needs to outlive the borrow, since `user` and
     // `parsed` are both owned before `req` is consumed below.
     let user = auth::extract_user(req.headers());
+    let host = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok());
     let parsed = routing::parse_request(
         req.method(),
         req.uri().path(),
         req.uri().query(),
         req.headers(),
+        host,
+        routing_config.base_domain.as_deref(),
     );
 
     // Handlers are stubs and do not read the body yet, but HTTP/1.1 keep-alive
@@ -82,7 +86,10 @@ impl ServerHandle {
     }
 }
 
-pub async fn serve(addr: SocketAddr) -> std::io::Result<ServerHandle> {
+pub async fn serve(
+    addr: SocketAddr,
+    routing_config: routing::RoutingConfig,
+) -> std::io::Result<ServerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -92,6 +99,7 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<ServerHandle> {
     // `graceful.watcher()` below), which is the type meant to be sent onto
     // another task.
     let graceful = GracefulShutdown::new();
+    let routing_config = std::sync::Arc::new(routing_config);
 
     let join_handle = tokio::spawn(async move {
         loop {
@@ -109,12 +117,17 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<ServerHandle> {
                     };
                     let io = TokioIo::new(stream);
                     let watcher = graceful.watcher();
+                    let routing_config = std::sync::Arc::clone(&routing_config);
                     tokio::spawn(async move {
                         // Built inside this task (rather than shared/cloned in)
                         // so the connection future it produces doesn't need to
                         // borrow anything from outside this task.
                         let builder = ConnBuilder::new(TokioExecutor::new());
-                        let conn = builder.serve_connection(io, service_fn(handle_request));
+                        let service = service_fn(move |req| {
+                            let routing_config = std::sync::Arc::clone(&routing_config);
+                            async move { handle_request(req, &routing_config).await }
+                        });
+                        let conn = builder.serve_connection(io, service);
                         let conn = watcher.watch(conn);
                         if let Err(err) = conn.await {
                             tracing::error!(error = %err, "connection error");

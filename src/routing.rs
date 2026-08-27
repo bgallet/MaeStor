@@ -5,11 +5,18 @@ use http::{HeaderMap, Method};
 use crate::error::S3Error;
 use crate::operation::S3Operation;
 
+#[derive(Debug, Clone, Default)]
+pub struct RoutingConfig {
+    pub base_domain: Option<String>,
+}
+
 pub fn parse_request(
     method: &Method,
     path: &str,
     query: Option<&str>,
     headers: &HeaderMap,
+    host: Option<&str>,
+    base_domain: Option<&str>,
 ) -> Result<S3Operation, S3Error> {
     let params = parse_query(query)?;
     // Strip exactly one leading slash, matching how a URI path is anchored —
@@ -17,6 +24,14 @@ pub fn parse_request(
     // something to collapse away, since it changes which segment is the
     // bucket name.
     let trimmed = path.strip_prefix('/').unwrap_or(path);
+
+    if let Some(bucket) = resolve_virtual_hosted_bucket(host, base_domain) {
+        return if trimmed.is_empty() {
+            parse_bucket_operation(method, &bucket, &params)
+        } else {
+            parse_object_operation(method, &bucket, &percent_decode(trimmed)?, &params, headers)
+        };
+    }
 
     if trimmed.is_empty() {
         return match *method {
@@ -37,6 +52,23 @@ pub fn parse_request(
         ),
         Some((bucket, _)) => parse_bucket_operation(method, &percent_decode(bucket)?, &params),
         None => parse_bucket_operation(method, &percent_decode(trimmed)?, &params),
+    }
+}
+
+/// A `Host` header resolves to a bucket when it ends with `.{base_domain}`
+/// and leaves a non-empty label before that suffix. Both sides are
+/// lowercased first so configuration and headers can differ in case. A bare
+/// `base_domain` (no bucket label) or a `Host` that doesn't match falls
+/// through to path-style routing.
+fn resolve_virtual_hosted_bucket(host: Option<&str>, base_domain: Option<&str>) -> Option<String> {
+    let host = host?.to_ascii_lowercase();
+    let base_domain = base_domain?.to_ascii_lowercase();
+    let suffix = format!(".{base_domain}");
+    let bucket = host.strip_suffix(&suffix)?;
+    if bucket.is_empty() {
+        None
+    } else {
+        Some(bucket.to_string())
     }
 }
 
@@ -451,7 +483,7 @@ mod tests {
         ];
 
         for (method, path, query, expected) in cases {
-            let result = parse_request(&method, path, query, &empty);
+            let result = parse_request(&method, path, query, &empty, None, None);
             assert_eq!(
                 result,
                 Ok(expected.clone()),
@@ -463,7 +495,7 @@ mod tests {
     #[test]
     fn put_object_with_copy_source_header_is_copy_object() {
         let headers = headers_with_copy_source("/src-bucket/src-key");
-        let result = parse_request(&Method::PUT, "/dst-bucket/dst-key", None, &headers);
+        let result = parse_request(&Method::PUT, "/dst-bucket/dst-key", None, &headers, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::CopyObject {
@@ -482,6 +514,8 @@ mod tests {
             "/my-bucket/my-key",
             Some("uploadId=up1"),
             &empty,
+            None,
+            None,
         );
         assert_eq!(result, Err(S3Error::InvalidRequest));
     }
@@ -489,7 +523,7 @@ mod tests {
     #[test]
     fn path_segments_are_percent_decoded() {
         let empty = HeaderMap::new();
-        let result = parse_request(&Method::GET, "/my%20bucket/my%20key", None, &empty);
+        let result = parse_request(&Method::GET, "/my%20bucket/my%20key", None, &empty, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::GetObject {
@@ -502,7 +536,7 @@ mod tests {
     #[test]
     fn encoded_slash_in_key_is_decoded_without_splitting_the_bucket() {
         let empty = HeaderMap::new();
-        let result = parse_request(&Method::GET, "/my-bucket/dir%2Ffile.txt", None, &empty);
+        let result = parse_request(&Method::GET, "/my-bucket/dir%2Ffile.txt", None, &empty, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::GetObject {
@@ -515,7 +549,7 @@ mod tests {
     #[test]
     fn plus_in_path_is_a_literal_plus_not_a_space() {
         let empty = HeaderMap::new();
-        let result = parse_request(&Method::GET, "/my-bucket/a+b", None, &empty);
+        let result = parse_request(&Method::GET, "/my-bucket/a+b", None, &empty, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::GetObject {
@@ -533,6 +567,8 @@ mod tests {
             "/my-bucket/my-key",
             Some("uploadId=ab+cd"),
             &empty,
+            None,
+            None,
         );
         assert_eq!(
             result,
@@ -552,6 +588,8 @@ mod tests {
             "/my-bucket/my-key",
             Some("uploadId=ab%20cd"),
             &empty,
+            None,
+            None,
         );
         assert_eq!(
             result,
@@ -566,7 +604,7 @@ mod tests {
     #[test]
     fn valueless_query_marker_still_registers() {
         let empty = HeaderMap::new();
-        let result = parse_request(&Method::GET, "/my-bucket", Some("acl"), &empty);
+        let result = parse_request(&Method::GET, "/my-bucket", Some("acl"), &empty, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::GetBucketAcl {
@@ -579,7 +617,7 @@ mod tests {
     fn invalid_percent_encoding_is_invalid_request() {
         let empty = HeaderMap::new();
         // %FF is not valid UTF-8 once decoded.
-        let result = parse_request(&Method::GET, "/my-bucket/bad%FFkey", None, &empty);
+        let result = parse_request(&Method::GET, "/my-bucket/bad%FFkey", None, &empty, None, None);
         assert_eq!(result, Err(S3Error::InvalidRequest));
     }
 
@@ -588,7 +626,7 @@ mod tests {
         let empty = HeaderMap::new();
         // A stray extra leading slash shifts what the bucket segment is; it
         // must not be silently trimmed away like the well-formed case.
-        let result = parse_request(&Method::GET, "//bucket/key", None, &empty);
+        let result = parse_request(&Method::GET, "//bucket/key", None, &empty, None, None);
         assert_eq!(
             result,
             Ok(S3Operation::GetObject {
@@ -601,7 +639,83 @@ mod tests {
     #[test]
     fn unsupported_bucket_method_is_method_not_allowed() {
         let empty = HeaderMap::new();
-        let result = parse_request(&Method::POST, "/my-bucket", None, &empty);
+        let result = parse_request(&Method::POST, "/my-bucket", None, &empty, None, None);
         assert_eq!(result, Err(S3Error::MethodNotAllowed));
+    }
+
+    #[test]
+    fn host_header_with_matching_base_domain_resolves_bucket_and_routes_as_key() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/my-key",
+            None,
+            &empty,
+            Some("mybucket.s3.test"),
+            Some("s3.test"),
+        );
+        assert_eq!(
+            result,
+            Ok(S3Operation::GetObject {
+                bucket: "mybucket".to_string(),
+                key: "my-key".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn host_header_with_empty_path_resolves_bucket_level_operation() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/",
+            None,
+            &empty,
+            Some("mybucket.s3.test"),
+            Some("s3.test"),
+        );
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "mybucket".to_string() }));
+    }
+
+    #[test]
+    fn host_matching_bare_base_domain_falls_back_to_path_style() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::PUT, "/my-bucket", None, &empty, Some("s3.test"), Some("s3.test"));
+        assert_eq!(result, Ok(S3Operation::CreateBucket { bucket: "my-bucket".to_string() }));
+    }
+
+    #[test]
+    fn host_not_matching_base_domain_falls_back_to_path_style() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/my-bucket",
+            None,
+            &empty,
+            Some("unrelated.example.com"),
+            Some("s3.test"),
+        );
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "my-bucket".to_string() }));
+    }
+
+    #[test]
+    fn no_base_domain_configured_always_uses_path_style() {
+        let empty = HeaderMap::new();
+        let result = parse_request(&Method::GET, "/my-bucket", None, &empty, Some("my-bucket.s3.test"), None);
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "my-bucket".to_string() }));
+    }
+
+    #[test]
+    fn host_header_case_is_ignored_when_matching_base_domain() {
+        let empty = HeaderMap::new();
+        let result = parse_request(
+            &Method::GET,
+            "/",
+            None,
+            &empty,
+            Some("MyBucket.S3.TEST"),
+            Some("S3.Test"),
+        );
+        assert_eq!(result, Ok(S3Operation::ListObjects { bucket: "mybucket".to_string() }));
     }
 }

@@ -1,10 +1,15 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
+use open_conductor::routing::RoutingConfig;
 use open_conductor::ServerHandle;
 
 async fn start_server() -> ServerHandle {
-    open_conductor::serve("127.0.0.1:0".parse().unwrap())
+    start_server_with_routing(RoutingConfig::default()).await
+}
+
+async fn start_server_with_routing(routing: RoutingConfig) -> ServerHandle {
+    open_conductor::serve("127.0.0.1:0".parse().unwrap(), routing)
         .await
         .expect("server should bind")
 }
@@ -82,4 +87,41 @@ async fn shutdown_stops_accepting_new_connections() {
         connect_result.is_err(),
         "server should no longer accept connections after shutdown"
     );
+}
+
+#[tokio::test]
+async fn host_based_bucket_routing_resolves_bucket_from_host_header() {
+    let handle = start_server_with_routing(RoutingConfig {
+        base_domain: Some("s3.test".to_string()),
+    })
+    .await;
+    let addr = handle.addr();
+    let request = "GET / HTTP/1.1\r\nHost: mybucket.s3.test\r\nConnection: close\r\n\r\n".to_string();
+
+    let response = tokio::task::spawn_blocking(move || send_request(addr, &request))
+        .await
+        .expect("blocking task should not panic");
+
+    // A bucket-level GET (ListObjects, a stub) is 501 — distinct from the
+    // 200 ListAllMyBucketsResult that would come back if the Host header
+    // were ignored and "/" fell through to path-style ListBuckets.
+    assert!(response.starts_with("HTTP/1.1 501"));
+    assert!(response.contains("NotImplemented"));
+}
+
+#[tokio::test]
+async fn host_not_matching_base_domain_still_uses_path_style_routing() {
+    let handle = start_server_with_routing(RoutingConfig {
+        base_domain: Some("s3.test".to_string()),
+    })
+    .await;
+    let addr = handle.addr();
+    let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
+
+    let response = tokio::task::spawn_blocking(move || send_request(addr, &request))
+        .await
+        .expect("blocking task should not panic");
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains("ListAllMyBucketsResult"));
 }

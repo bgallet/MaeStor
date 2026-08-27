@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
         .parse()?;
 
-    let handle = open_conductor::serve(addr).await?;
+    let handle = open_conductor::serve(addr, open_conductor::routing::RoutingConfig::default()).await?;
     tracing::info!(addr = %handle.addr(), "listening");
 
     tokio::signal::ctrl_c().await?;
