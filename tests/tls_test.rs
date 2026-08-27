@@ -11,15 +11,37 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing_test::traced_test;
 
-fn client_config_trusting(ca_pem: &str) -> rustls::ClientConfig {
+fn build_root_store(ca_pem: &str) -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     let mut reader = ca_pem.as_bytes();
     for cert in rustls_pemfile::certs(&mut reader) {
         roots.add(cert.expect("valid CA cert")).expect("add CA to root store");
     }
+    roots
+}
+
+fn client_config_trusting(ca_pem: &str) -> rustls::ClientConfig {
     rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(build_root_store(ca_pem))
         .with_no_client_auth()
+}
+
+/// Retries `attempt` (one full handshake/connection attempt, returning
+/// whether it succeeded) until it succeeds or `deadline` passes — file
+/// watcher event delivery timing isn't guaranteed, so a reload test can't
+/// just try once.
+async fn poll_until_ok<F, Fut>(deadline: std::time::Instant, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        if attempt().await {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn handshake_ok(server_config: Arc<rustls::ServerConfig>, client_config: rustls::ClientConfig, sni: &str) {
@@ -85,11 +107,7 @@ async fn chain_file_sends_the_full_chain_to_the_client() {
 }
 
 fn client_config_with_cert(ca_pem: &str, cert_pem: &str, key_pem: &str) -> rustls::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    let mut ca_reader = ca_pem.as_bytes();
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
-        roots.add(cert.expect("valid CA cert")).expect("add CA to root store");
-    }
+    let roots = build_root_store(ca_pem);
     let mut cert_reader = cert_pem.as_bytes();
     let client_chain: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -213,19 +231,16 @@ async fn reload_picks_up_a_rotated_certificate() {
 
     // Poll until the swap is observed — file watcher delivery timing isn't guaranteed.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    poll_until_ok(deadline, || async {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let acceptor = TlsAcceptor::from(reloadable.current());
         let connector = TlsConnector::from(Arc::new(client_config_trusting(&other_ca_pem)));
         let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
         let (server_result, client_result) =
             tokio::join!(acceptor.accept(server_io), connector.connect(name, client_io));
-        if server_result.is_ok() && client_result.is_ok() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+        server_result.is_ok() && client_result.is_ok()
+    })
+    .await;
 }
 
 /// Restores the process's current directory on drop, even if the test body
@@ -524,14 +539,11 @@ async fn serve_tls_reloads_a_rotated_certificate_without_restarting() {
     std::fs::write(&key_path, &second_leaf.key_pem).expect("rewrite key file");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    poll_until_ok(deadline, || async {
         let tcp = tokio::net::TcpStream::connect(handle.addr()).await.expect("connect");
         let connector = TlsConnector::from(Arc::new(client_config_trusting(&other_ca_pem)));
         let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
-        if connector.connect(name, tcp).await.is_ok() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+        connector.connect(name, tcp).await.is_ok()
+    })
+    .await;
 }

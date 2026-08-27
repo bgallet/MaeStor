@@ -56,15 +56,13 @@ fn resolve_tls_config(
                 Ok(None)
             }
         }
-        (Some(_), None) => Err(format!(
-            "{TLS_CERT_CHAIN_ENV_VAR} is set but {TLS_PRIVATE_KEY_ENV_VAR} is not; \
-             TLS requires both to be set"
-        )),
-        (None, Some(_)) => Err(format!(
-            "{TLS_PRIVATE_KEY_ENV_VAR} is set but {TLS_CERT_CHAIN_ENV_VAR} is not; \
-             TLS requires both to be set"
-        )),
+        (Some(_), None) => Err(half_configured_tls_error(TLS_CERT_CHAIN_ENV_VAR, TLS_PRIVATE_KEY_ENV_VAR)),
+        (None, Some(_)) => Err(half_configured_tls_error(TLS_PRIVATE_KEY_ENV_VAR, TLS_CERT_CHAIN_ENV_VAR)),
     }
+}
+
+fn half_configured_tls_error(set: &str, missing: &str) -> String {
+    format!("{set} is set but {missing} is not; TLS requires both to be set")
 }
 
 #[tokio::main]

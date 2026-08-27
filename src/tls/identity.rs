@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::FromDer;
@@ -14,6 +16,22 @@ pub fn extract_email_identity(cert_der: &[u8]) -> Option<String> {
         GeneralName::RFC822Name(email) => Some(email.to_string()),
         _ => None,
     })
+}
+
+/// Resolves the identity to use for requests on a TLS connection from its
+/// verified peer certificate, if any. Distinguishes "no client cert
+/// presented" (silent — mTLS client certs are always optional) from "a cert
+/// was presented and passed chain validation, but has no email SAN" (logged
+/// at `warn`, since it's a verified identity that still falls back to header
+/// auth). Returns `Arc<str>` rather than `String` so cloning it once per
+/// request on a keep-alive connection is a refcount bump, not an allocation.
+pub fn resolve_peer_identity(connection: &rustls::ServerConnection) -> Option<Arc<str>> {
+    let cert = connection.peer_certificates()?.first()?;
+    let identity = extract_email_identity(cert);
+    if identity.is_none() {
+        tracing::warn!("client certificate verified but has no email SAN; falling back to header auth");
+    }
+    identity.map(|email| Arc::from(email.as_str()))
 }
 
 #[cfg(test)]

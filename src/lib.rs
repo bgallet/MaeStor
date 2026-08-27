@@ -7,6 +7,7 @@ pub mod logging;
 pub mod tls;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,7 +18,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 /// How long to wait after a failed `accept()` before trying again, so that a
@@ -68,7 +69,7 @@ pub async fn handle_request(
     Ok(logging::log_request(&identity.user, identity.method, parsed).await)
 }
 
-/// Handle to a running server, returned by [`serve`].
+/// Handle to a running server, returned by [`serve`] or [`serve_tls`].
 ///
 /// Dropping this without calling [`shutdown`](ServerHandle::shutdown) leaves
 /// the accept loop running in the background for the rest of the process —
@@ -99,12 +100,30 @@ impl ServerHandle {
     }
 }
 
-pub async fn serve(
-    addr: SocketAddr,
+/// Runs the accept loop shared by [`serve`] and [`serve_tls`]: bind already
+/// happened in the caller (the two entry points fail differently — plain
+/// `io::Error` vs. `TlsError` — so they map bind errors themselves), and this
+/// owns accepting connections, spawning one task per connection, and
+/// graceful shutdown.
+///
+/// `connect` turns a raw `TcpStream` into the transport-specific IO to hand
+/// to hyper (a plain passthrough for `serve`, a TLS handshake for
+/// `serve_tls`) plus that connection's resolved peer identity, if any.
+/// Returning `None` drops the connection (e.g. a failed TLS handshake)
+/// without tearing down the loop.
+async fn run_accept_loop<C, Fut, IO>(
+    listener: TcpListener,
     routing_config: routing::RoutingConfig,
-) -> std::io::Result<ServerHandle> {
-    let listener = TcpListener::bind(addr).await?;
-    let local_addr = listener.local_addr()?;
+    connect: C,
+) -> ServerHandle
+where
+    C: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<(IO, Option<Arc<str>>)>> + Send + 'static,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let local_addr = listener
+        .local_addr()
+        .expect("a bound listener always has a local address");
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     // Not Clone by design (see hyper_util's docs): stays owned by this task
     // for its whole life, and is consumed exactly once by `.shutdown()`
@@ -112,7 +131,8 @@ pub async fn serve(
     // `graceful.watcher()` below), which is the type meant to be sent onto
     // another task.
     let graceful = GracefulShutdown::new();
-    let routing_config = std::sync::Arc::new(routing_config);
+    let routing_config = Arc::new(routing_config);
+    let connect = Arc::new(connect);
 
     let join_handle = tokio::spawn(async move {
         loop {
@@ -128,17 +148,27 @@ pub async fn serve(
                             continue;
                         }
                     };
-                    let io = TokioIo::new(stream);
                     let watcher = graceful.watcher();
-                    let routing_config = std::sync::Arc::clone(&routing_config);
+                    let routing_config = Arc::clone(&routing_config);
+                    let connect = Arc::clone(&connect);
                     tokio::spawn(async move {
+                        let Some((io, peer_identity)) = connect(stream).await else {
+                            return;
+                        };
                         // Built inside this task (rather than shared/cloned in)
                         // so the connection future it produces doesn't need to
                         // borrow anything from outside this task.
+                        let io = TokioIo::new(io);
                         let builder = ConnBuilder::new(TokioExecutor::new());
                         let service = service_fn(move |req| {
-                            let routing_config = std::sync::Arc::clone(&routing_config);
-                            async move { handle_request(req, &routing_config, None).await }
+                            let routing_config = Arc::clone(&routing_config);
+                            // `Arc<str>` clone is a refcount bump, not an
+                            // allocation — cheap even though this runs once
+                            // per request on a keep-alive connection.
+                            let peer_identity = peer_identity.clone();
+                            async move {
+                                handle_request(req, &routing_config, peer_identity.as_deref()).await
+                            }
                         });
                         let conn = builder.serve_connection(io, service);
                         let conn = watcher.watch(conn);
@@ -164,11 +194,22 @@ pub async fn serve(
         }
     });
 
-    Ok(ServerHandle {
+    ServerHandle {
         addr: local_addr,
         shutdown_tx,
         join_handle,
+    }
+}
+
+pub async fn serve(
+    addr: SocketAddr,
+    routing_config: routing::RoutingConfig,
+) -> std::io::Result<ServerHandle> {
+    let listener = TcpListener::bind(addr).await?;
+    Ok(run_accept_loop(listener, routing_config, |stream: TcpStream| async move {
+        Some((stream, None::<Arc<str>>))
     })
+    .await)
 }
 
 pub async fn serve_tls(
@@ -177,85 +218,23 @@ pub async fn serve_tls(
     tls_config: tls::TlsConfig,
 ) -> Result<ServerHandle, tls::TlsError> {
     let listener = TcpListener::bind(addr).await.map_err(tls::TlsError::Io)?;
-    let local_addr = listener.local_addr().map_err(tls::TlsError::Io)?;
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let graceful = GracefulShutdown::new();
-    let routing_config = std::sync::Arc::new(routing_config);
-    let reloadable = std::sync::Arc::new(tls::ReloadableConfig::start(tls_config)?);
+    let reloadable = Arc::new(tls::ReloadableConfig::start(tls_config)?);
 
-    let join_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    let (stream, _) = match accept_result {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            tracing::error!(error = %err, "accept error");
-                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                            continue;
-                        }
-                    };
-                    let watcher = graceful.watcher();
-                    let routing_config = std::sync::Arc::clone(&routing_config);
-                    let reloadable = std::sync::Arc::clone(&reloadable);
-                    tokio::spawn(async move {
-                        let acceptor = tokio_rustls::TlsAcceptor::from(reloadable.current());
-                        let tls_stream = match acceptor.accept(stream).await {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                tracing::warn!(error = %err, "TLS handshake failed");
-                                return;
-                            }
-                        };
-
-                        // Distinguish "no client cert presented" (silent, expected —
-                        // mTLS client certs are always optional) from "a cert was
-                        // presented and passed chain validation, but has no email
-                        // SAN" (worth a warning: it's a verified identity that
-                        // still can't be used, so this connection silently falls
-                        // back to header auth instead).
-                        let peer_identity = match tls_stream.get_ref().1.peer_certificates().and_then(|c| c.first()) {
-                            Some(cert) => {
-                                let identity = tls::extract_email_identity(cert);
-                                if identity.is_none() {
-                                    tracing::warn!(
-                                        "client certificate verified but has no email SAN; falling back to header auth"
-                                    );
-                                }
-                                identity
-                            }
-                            None => None,
-                        };
-
-                        let io = TokioIo::new(tls_stream);
-                        let builder = ConnBuilder::new(TokioExecutor::new());
-                        let service = service_fn(move |req| {
-                            let routing_config = std::sync::Arc::clone(&routing_config);
-                            let peer_identity = peer_identity.clone();
-                            async move {
-                                handle_request(req, &routing_config, peer_identity.as_deref()).await
-                            }
-                        });
-                        let conn = builder.serve_connection(io, service);
-                        let conn = watcher.watch(conn);
-                        if let Err(err) = conn.await {
-                            tracing::error!(error = %err, "connection error");
-                        }
-                    });
+    let connect = move |stream: TcpStream| {
+        let reloadable = Arc::clone(&reloadable);
+        async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(reloadable.current());
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    tracing::warn!(error = %err, "TLS handshake failed");
+                    return None;
                 }
-                _ = &mut shutdown_rx => {
-                    tracing::info!("shutdown requested; no longer accepting new connections");
-                    break;
-                }
-            }
+            };
+            let peer_identity = tls::resolve_peer_identity(tls_stream.get_ref().1);
+            Some((tls_stream, peer_identity))
         }
+    };
 
-        if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown()).await.is_err() {
-            tracing::warn!("graceful shutdown timed out; dropping remaining connections");
-        } else {
-            tracing::info!("all connections closed gracefully");
-        }
-    });
-
-    Ok(ServerHandle { addr: local_addr, shutdown_tx, join_handle })
+    Ok(run_accept_loop(listener, routing_config, connect).await)
 }

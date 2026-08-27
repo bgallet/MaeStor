@@ -6,7 +6,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
 mod identity;
-pub use identity::extract_email_identity;
+pub use identity::{extract_email_identity, resolve_peer_identity};
 
 mod reload;
 pub use reload::ReloadableConfig;

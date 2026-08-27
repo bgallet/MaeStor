@@ -69,14 +69,26 @@ pub fn parse_request(
 /// matching.
 fn resolve_virtual_hosted_bucket(host: Option<&str>, base_domain: Option<&str>) -> Option<String> {
     let host = strip_host_port(host?);
-    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    let base_domain = base_domain?.to_ascii_lowercase();
-    let suffix = format!(".{base_domain}");
-    let bucket = host.strip_suffix(&suffix)?;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let base_domain = base_domain?;
+
+    // Case-insensitive ".{base_domain}" suffix match, without allocating a
+    // lowercased copy of the whole host and base domain on every request —
+    // this runs once per request, and both inputs are otherwise unchanged.
+    // `split_at` lands on the '.' byte found below, which — being a
+    // single-byte ASCII character — is always a valid `str` char boundary
+    // regardless of what other bytes `host` contains.
+    let host_bytes = host.as_bytes();
+    let split_at = host_bytes.len().checked_sub(base_domain.len() + 1)?;
+    if host_bytes[split_at] != b'.' || !host[split_at + 1..].eq_ignore_ascii_case(base_domain) {
+        return None;
+    }
+
+    let bucket = &host[..split_at];
     if bucket.is_empty() {
         None
     } else {
-        Some(bucket.to_string())
+        Some(bucket.to_ascii_lowercase())
     }
 }
 
