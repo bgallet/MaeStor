@@ -34,10 +34,21 @@ pub async fn handle_request(
     peer_identity: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // Borrow directly from `req` rather than cloning method/path/query/headers
-    // up front — nothing here needs to outlive the borrow, since `user` and
-    // `parsed` are both owned before `req` is consumed below.
-    let user = auth::extract_user(req.headers(), peer_identity);
-    let host = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok());
+    // up front — nothing here needs to outlive the borrow, since `identity`
+    // and `parsed` are both owned before `req` is consumed below.
+    let identity = auth::extract_user(req.headers(), peer_identity);
+    // Prefer the request-target's own authority over the `Host` header.
+    // HTTP/2 carries the authority as the `:authority` pseudo-header, which
+    // hyper surfaces via `req.uri().authority()` — never in the header map —
+    // so a Host-header-only lookup silently sees no host at all for h2
+    // requests. The same `uri().authority()` path also covers HTTP/1.1
+    // absolute-form request-targets (RFC 9112 §3.2.2). Falling back to the
+    // `Host` header keeps today's HTTP/1.1 origin-form behavior unchanged.
+    let host = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok()));
     let parsed = routing::parse_request(
         req.method(),
         req.uri().path(),
@@ -54,7 +65,7 @@ pub async fn handle_request(
         tracing::warn!(error = %err, "failed to drain request body");
     }
 
-    Ok(logging::log_request(&user, parsed).await)
+    Ok(logging::log_request(&identity.user, identity.method, parsed).await)
 }
 
 /// Handle to a running server, returned by [`serve`].
@@ -197,12 +208,24 @@ pub async fn serve_tls(
                             }
                         };
 
-                        let peer_identity = tls_stream
-                            .get_ref()
-                            .1
-                            .peer_certificates()
-                            .and_then(|certs| certs.first())
-                            .and_then(|cert| tls::extract_email_identity(cert));
+                        // Distinguish "no client cert presented" (silent, expected —
+                        // mTLS client certs are always optional) from "a cert was
+                        // presented and passed chain validation, but has no email
+                        // SAN" (worth a warning: it's a verified identity that
+                        // still can't be used, so this connection silently falls
+                        // back to header auth instead).
+                        let peer_identity = match tls_stream.get_ref().1.peer_certificates().and_then(|c| c.first()) {
+                            Some(cert) => {
+                                let identity = tls::extract_email_identity(cert);
+                                if identity.is_none() {
+                                    tracing::warn!(
+                                        "client certificate verified but has no email SAN; falling back to header auth"
+                                    );
+                                }
+                                identity
+                            }
+                            None => None,
+                        };
 
                         let io = TokioIo::new(tls_stream);
                         let builder = ConnBuilder::new(TokioExecutor::new());

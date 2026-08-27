@@ -110,6 +110,34 @@ async fn host_based_bucket_routing_resolves_bucket_from_host_header() {
 }
 
 #[tokio::test]
+async fn absolute_form_request_target_authority_is_used_for_host_based_routing() {
+    let handle = start_server_with_routing(RoutingConfig {
+        base_domain: Some("s3.test".to_string()),
+    })
+    .await;
+    let addr = handle.addr();
+    // Absolute-form request-target (RFC 9112 §3.2.2) carries its own
+    // authority, "mybucket.s3.test" — deliberately different from the `Host`
+    // header's "unrelated.example.com". hyper surfaces a request-target's
+    // authority via `req.uri().authority()`, which handle_request now
+    // prefers over the `Host` header (the same code path an HTTP/2 request's
+    // `:authority` pseudo-header takes, since neither is ever present in the
+    // header map). If handle_request only ever looked at the `Host` header,
+    // this would fall through to path-style routing on "unrelated.example.com"
+    // (which doesn't match the base domain) and return 200 ListAllMyBucketsResult.
+    let request =
+        "GET http://mybucket.s3.test/ HTTP/1.1\r\nHost: unrelated.example.com\r\nConnection: close\r\n\r\n"
+            .to_string();
+
+    let response = tokio::task::spawn_blocking(move || send_request(addr, &request))
+        .await
+        .expect("blocking task should not panic");
+
+    assert!(response.starts_with("HTTP/1.1 501"), "expected 501, got: {response}");
+    assert!(response.contains("NotImplemented"));
+}
+
+#[tokio::test]
 async fn host_not_matching_base_domain_still_uses_path_style_routing() {
     let handle = start_server_with_routing(RoutingConfig {
         base_domain: Some("s3.test".to_string()),

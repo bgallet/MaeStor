@@ -1,5 +1,6 @@
 mod support;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use open_conductor::routing::RoutingConfig;
@@ -227,6 +228,53 @@ async fn reload_picks_up_a_rotated_certificate() {
     }
 }
 
+/// Restores the process's current directory on drop, even if the test body
+/// panics — used only by
+/// `reloadable_config_starts_with_bare_filename_paths`, the single test in
+/// this crate that touches process-wide current-directory state. No other
+/// test (here or elsewhere in the crate) resolves a path relative to the
+/// current directory — `tempfile::tempdir()` always yields absolute paths —
+/// so this is safe under parallel test execution within this binary.
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn change_to(dir: &std::path::Path) -> Self {
+        let original = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(dir).expect("chdir into tempdir");
+        CwdGuard(original)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn reloadable_config_starts_with_bare_filename_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+
+    // Bare filenames (no directory component) reproduce the bug directly:
+    // `Path::parent()` on a name with no directory returns `Some("")`, and
+    // watching "" used to fail outright, so `ReloadableConfig::start` (and
+    // thus the whole server) refused to start. Change into the tempdir so
+    // the bare filenames below resolve to the real cert/key files.
+    let _cwd_guard = CwdGuard::change_to(dir.path());
+    let reloadable = ReloadableConfig::start(TlsConfig {
+        cert_chain_path: PathBuf::from(chain_path.file_name().expect("chain path has a filename")),
+        private_key_path: PathBuf::from(key_path.file_name().expect("key path has a filename")),
+        client_ca_path: None,
+    })
+    .expect("start should succeed with bare filename paths (no directory component)");
+
+    handshake_ok(reloadable.current(), client_config_trusting(&ca_pem), "bucket.s3.test").await;
+}
+
 async fn start_tls_server(tls_config: TlsConfig, routing: RoutingConfig) -> open_conductor::ServerHandle {
     open_conductor::serve_tls("127.0.0.1:0".parse().unwrap(), routing, tls_config)
         .await
@@ -303,6 +351,76 @@ async fn serve_tls_with_client_cert_resolves_identity_from_the_certificate() {
     assert!(response.starts_with("HTTP/1.1 200"));
     assert!(logs_contain("alice@example.com"));
     assert!(!logs_contain("AKIAOTHER"));
+}
+
+#[traced_test]
+#[tokio::test]
+async fn serve_tls_with_verified_cert_but_no_email_san_warns_and_falls_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    // A DNS-SAN-only cert, signed by the trusted client CA: it passes chain
+    // validation as a client certificate, but has no rfc822Name SAN for
+    // `extract_email_identity` to find — the "verified but no usable
+    // identity" case, distinct from "no client cert presented at all".
+    let client_cert_with_no_email_san = support::issue_server_cert(&issuer, "no-email.example.com");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path, private_key_path: key_path, client_ca_path: Some(client_ca_path) },
+        RoutingConfig::default(),
+    )
+    .await;
+
+    let client_config = Arc::new(client_config_with_cert(
+        &ca_pem,
+        &client_cert_with_no_email_san.cert_pem,
+        &client_cert_with_no_email_san.key_pem,
+    ));
+
+    let request = "GET / HTTP/1.1\r\nHost: bucket.s3.test\r\nConnection: close\r\n\r\n";
+    let response = send_tls_request(handle.addr(), client_config, "bucket.s3.test", request).await;
+
+    // The connection succeeds and the request falls back to the (here,
+    // header-less) SigV4/anonymous path rather than failing or picking up an
+    // identity.
+    assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+    assert!(response.contains("ListAllMyBucketsResult"));
+    assert!(logs_contain("client certificate verified but has no email SAN"));
+}
+
+#[tokio::test]
+async fn serve_tls_host_based_routing_resolves_bucket_from_host_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path, private_key_path: key_path, client_ca_path: None },
+        RoutingConfig { base_domain: Some("s3.test".to_string()) },
+    )
+    .await;
+
+    let response = send_tls_request(
+        handle.addr(),
+        Arc::new(client_config_trusting(&ca_pem)),
+        "mybucket.s3.test",
+        "GET / HTTP/1.1\r\nHost: mybucket.s3.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    // A bucket-level GET (ListObjects, a stub) is 501 — distinct from the 200
+    // ListAllMyBucketsResult that plain path-style routing on "/" would
+    // produce if the Host header (and SNI) were ignored. Same discriminator
+    // tests/integration_test.rs's host-routing test uses, now proven over a
+    // real TLS connection (SNI `mybucket.s3.test` against a `*.s3.test`
+    // wildcard cert, `Host: mybucket.s3.test`).
+    assert!(response.starts_with("HTTP/1.1 501"), "expected 501, got: {response}");
+    assert!(response.contains("NotImplemented"));
 }
 
 #[tokio::test]

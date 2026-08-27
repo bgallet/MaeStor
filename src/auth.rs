@@ -2,17 +2,70 @@ use http::HeaderMap;
 
 pub const ANONYMOUS_USER: &str = "anonymous";
 
-pub fn extract_user(headers: &HeaderMap, peer_identity: Option<&str>) -> String {
+/// How a request's identity was established. Threaded into the audit log
+/// (`logging::log_request`) as `auth_method`, distinct from the `user` string
+/// itself, so a log reader can tell a cryptographically-verified client-cert
+/// identity apart from a bare, unverified claim in a SigV4 header (today's
+/// SigV4 signature checking is still a stub — see the SSL/TLS design doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// Identity came from a client certificate that passed TLS chain
+    /// validation and had an email SAN.
+    ClientCert,
+    /// Identity came from parsing a SigV4 `Authorization` header's
+    /// `Credential=` field. The signature itself is not yet verified.
+    SigV4Header,
+    /// No identity could be established (no client cert, no/unparseable
+    /// `Authorization` header).
+    Anonymous,
+}
+
+impl AuthMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthMethod::ClientCert => "client_cert",
+            AuthMethod::SigV4Header => "sigv4_header",
+            AuthMethod::Anonymous => "anonymous",
+        }
+    }
+}
+
+/// A request's resolved identity: who it's from, and how that was decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub user: String,
+    pub method: AuthMethod,
+}
+
+pub fn extract_user(headers: &HeaderMap, peer_identity: Option<&str>) -> Identity {
     if let Some(identity) = peer_identity {
-        return identity.to_string();
+        return Identity {
+            user: identity.to_string(),
+            method: AuthMethod::ClientCert,
+        };
     }
     let Some(value) = headers.get(http::header::AUTHORIZATION) else {
-        return ANONYMOUS_USER.to_string();
+        return Identity {
+            user: ANONYMOUS_USER.to_string(),
+            method: AuthMethod::Anonymous,
+        };
     };
     let Ok(value) = value.to_str() else {
-        return ANONYMOUS_USER.to_string();
+        return Identity {
+            user: ANONYMOUS_USER.to_string(),
+            method: AuthMethod::Anonymous,
+        };
     };
-    parse_access_key(value).unwrap_or_else(|| ANONYMOUS_USER.to_string())
+    match parse_access_key(value) {
+        Some(user) => Identity {
+            user,
+            method: AuthMethod::SigV4Header,
+        },
+        None => Identity {
+            user: ANONYMOUS_USER.to_string(),
+            method: AuthMethod::Anonymous,
+        },
+    }
 }
 
 fn parse_access_key(auth_header: &str) -> Option<String> {
@@ -37,7 +90,9 @@ mod tests {
     #[test]
     fn missing_header_falls_back_to_anonymous() {
         let headers = HeaderMap::new();
-        assert_eq!(extract_user(&headers, None), ANONYMOUS_USER);
+        let identity = extract_user(&headers, None);
+        assert_eq!(identity.user, ANONYMOUS_USER);
+        assert_eq!(identity.method, AuthMethod::Anonymous);
     }
 
     #[test]
@@ -50,7 +105,9 @@ mod tests {
                  SignedHeaders=host;x-amz-date, Signature=abc123",
             ),
         );
-        assert_eq!(extract_user(&headers, None), "AKIAEXAMPLE");
+        let identity = extract_user(&headers, None);
+        assert_eq!(identity.user, "AKIAEXAMPLE");
+        assert_eq!(identity.method, AuthMethod::SigV4Header);
     }
 
     #[test]
@@ -60,7 +117,9 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("not-a-sigv4-header"),
         );
-        assert_eq!(extract_user(&headers, None), ANONYMOUS_USER);
+        let identity = extract_user(&headers, None);
+        assert_eq!(identity.user, ANONYMOUS_USER);
+        assert_eq!(identity.method, AuthMethod::Anonymous);
     }
 
     #[test]
@@ -73,12 +132,16 @@ mod tests {
                  SignedHeaders=host;x-amz-date, Signature=abc123",
             ),
         );
-        assert_eq!(extract_user(&headers, Some("alice@example.com")), "alice@example.com");
+        let identity = extract_user(&headers, Some("alice@example.com"));
+        assert_eq!(identity.user, "alice@example.com");
+        assert_eq!(identity.method, AuthMethod::ClientCert);
     }
 
     #[test]
     fn missing_peer_identity_falls_back_to_header_parsing() {
         let empty = HeaderMap::new();
-        assert_eq!(extract_user(&empty, None), ANONYMOUS_USER);
+        let identity = extract_user(&empty, None);
+        assert_eq!(identity.user, ANONYMOUS_USER);
+        assert_eq!(identity.method, AuthMethod::Anonymous);
     }
 }

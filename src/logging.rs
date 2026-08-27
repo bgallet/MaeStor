@@ -6,6 +6,7 @@ use http_body::Body as _;
 use http_body_util::Full;
 use tracing::info;
 
+use crate::auth::AuthMethod;
 use crate::error::S3Error;
 use crate::handlers::dispatch;
 use crate::operation::S3Operation;
@@ -39,9 +40,14 @@ pub fn init() {
 /// Either way exactly one `s3_request` event is emitted, and `bytes` measures
 /// the body of the response that actually goes out over the wire. `operation`
 /// is `None` when routing itself failed, since there is no `S3Operation` to
-/// report in that case.
+/// report in that case. `auth_method` records how `user` was established
+/// (`"client_cert"`, `"sigv4_header"`, or `"anonymous"`) — distinct
+/// information from `user` itself, since a bare header-derived `user` string
+/// is an unverified claim (SigV4 signature checking is still a stub) while a
+/// `client_cert` identity has passed TLS chain validation.
 pub async fn log_request(
     user: &str,
+    auth_method: AuthMethod,
     parsed: Result<S3Operation, S3Error>,
 ) -> Response<Full<Bytes>> {
     let start = Instant::now();
@@ -66,6 +72,7 @@ pub async fn log_request(
 
     info!(
         user,
+        auth_method = auth_method.as_str(),
         operation,
         duration_ms,
         bytes,
@@ -95,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn log_request_forwards_success_result() {
-        let response = log_request("test-user", Ok(S3Operation::ListBuckets)).await;
+        let response = log_request("test-user", AuthMethod::Anonymous, Ok(S3Operation::ListBuckets)).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_string(response).await.contains("ListAllMyBucketsResult"));
     }
@@ -105,21 +112,21 @@ mod tests {
         let op = S3Operation::CreateBucket {
             bucket: "b".to_string(),
         };
-        let response = log_request("test-user", Ok(op)).await;
+        let response = log_request("test-user", AuthMethod::Anonymous, Ok(op)).await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         assert!(body_string(response).await.contains("NotImplemented"));
     }
 
     #[tokio::test]
     async fn log_request_converts_parse_error_to_response() {
-        let response = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        let response = log_request("test-user", AuthMethod::Anonymous, Err(S3Error::MethodNotAllowed)).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(body_string(response).await.contains("MethodNotAllowed"));
     }
 
     #[tokio::test]
     async fn error_responses_have_a_non_empty_measurable_body() {
-        let response = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        let response = log_request("test-user", AuthMethod::Anonymous, Err(S3Error::MethodNotAllowed)).await;
         let bytes = response.body().size_hint().exact().expect("exact size hint");
         assert!(bytes > 0, "error responses must report real byte counts");
     }
@@ -131,7 +138,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn log_request_emits_s3_request_with_operation_name_on_success() {
-        let _ = log_request("test-user", Ok(S3Operation::ListBuckets)).await;
+        let _ = log_request("test-user", AuthMethod::Anonymous, Ok(S3Operation::ListBuckets)).await;
         assert!(logs_contain("s3_request"));
         assert!(logs_contain("ListBuckets"));
     }
@@ -142,7 +149,7 @@ mod tests {
         let op = S3Operation::CreateBucket {
             bucket: "b".to_string(),
         };
-        let _ = log_request("test-user", Ok(op)).await;
+        let _ = log_request("test-user", AuthMethod::Anonymous, Ok(op)).await;
         assert!(logs_contain("s3_request"));
         assert!(logs_contain("CreateBucket"));
     }
@@ -150,7 +157,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn log_request_emits_s3_request_without_an_operation_name_on_parse_error() {
-        let _ = log_request("test-user", Err(S3Error::MethodNotAllowed)).await;
+        let _ = log_request("test-user", AuthMethod::Anonymous, Err(S3Error::MethodNotAllowed)).await;
         assert!(logs_contain("s3_request"));
         // `operation` is `Option<&str>`; tracing's blanket `Value` impl for
         // `Option<T>` skips the visitor entirely when the value is `None`, so
@@ -192,7 +199,11 @@ mod tests {
     /// `s3_request` event. Unlike `#[traced_test]` (which uses its own
     /// text-based formatter), this exercises the exact JSON shape `init()`
     /// configures — the level `tracing-test`'s `logs_contain` can't reach.
-    async fn s3_request_json(user: &str, parsed: Result<S3Operation, S3Error>) -> serde_json::Value {
+    async fn s3_request_json(
+        user: &str,
+        auth_method: AuthMethod,
+        parsed: Result<S3Operation, S3Error>,
+    ) -> serde_json::Value {
         let buffer = SharedBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -202,7 +213,7 @@ mod tests {
 
         {
             let _guard = tracing::subscriber::set_default(subscriber);
-            let _ = log_request(user, parsed).await;
+            let _ = log_request(user, auth_method, parsed).await;
         }
 
         let captured = buffer.0.lock().unwrap();
@@ -215,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_request_event_serializes_numeric_fields_as_json_numbers() {
-        let event = s3_request_json("test-user", Ok(S3Operation::ListBuckets)).await;
+        let event = s3_request_json("test-user", AuthMethod::Anonymous, Ok(S3Operation::ListBuckets)).await;
 
         assert!(
             event["fields"]["duration_ms"].is_number(),
@@ -233,11 +244,49 @@ mod tests {
 
     #[tokio::test]
     async fn s3_request_event_omits_operation_field_on_parse_error() {
-        let event = s3_request_json("test-user", Err(S3Error::MethodNotAllowed)).await;
+        let event = s3_request_json("test-user", AuthMethod::Anonymous, Err(S3Error::MethodNotAllowed)).await;
 
         assert!(
             event["fields"].get("operation").is_none(),
             "operation field should be omitted entirely for parse errors: {event}"
         );
+    }
+
+    #[tokio::test]
+    async fn s3_request_event_records_client_cert_auth_method() {
+        let event = s3_request_json(
+            "alice@example.com",
+            AuthMethod::ClientCert,
+            Ok(S3Operation::ListBuckets),
+        )
+        .await;
+
+        assert_eq!(event["fields"]["auth_method"], "client_cert", "{event}");
+        assert_eq!(event["fields"]["user"], "alice@example.com", "{event}");
+    }
+
+    #[tokio::test]
+    async fn s3_request_event_records_sigv4_header_auth_method() {
+        let event = s3_request_json(
+            "AKIAEXAMPLE",
+            AuthMethod::SigV4Header,
+            Ok(S3Operation::ListBuckets),
+        )
+        .await;
+
+        assert_eq!(event["fields"]["auth_method"], "sigv4_header", "{event}");
+        assert_eq!(event["fields"]["user"], "AKIAEXAMPLE", "{event}");
+    }
+
+    #[tokio::test]
+    async fn s3_request_event_records_anonymous_auth_method() {
+        let event = s3_request_json(
+            "anonymous",
+            AuthMethod::Anonymous,
+            Ok(S3Operation::ListBuckets),
+        )
+        .await;
+
+        assert_eq!(event["fields"]["auth_method"], "anonymous", "{event}");
     }
 }
