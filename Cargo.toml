@@ -18,6 +18,8 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 x509-parser = "0.18"
+arc-swap = "1"
+notify = "8"
 
 [dev-dependencies]
 tracing-test = "0.2"

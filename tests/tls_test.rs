@@ -2,7 +2,7 @@ mod support;
 
 use std::sync::Arc;
 
-use open_conductor::tls::{load_server_config, TlsConfig};
+use open_conductor::tls::{load_server_config, ReloadableConfig, TlsConfig};
 use rcgen::Issuer;
 use rustls::pki_types::ServerName;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -179,4 +179,47 @@ async fn mtls_rejects_a_client_cert_signed_by_an_untrusted_ca() {
     let (server_result, _client_result) =
         tokio::join!(acceptor.accept(server_io), connector.connect(name, client_io));
     assert!(server_result.is_err(), "handshake should fail for an untrusted client cert");
+}
+
+#[tokio::test]
+async fn reload_picks_up_a_rotated_certificate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let first_leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &first_leaf);
+
+    let (other_ca_pem, other_ca_params, other_ca_key) = support::generate_ca();
+    let other_issuer = Issuer::from_params(&other_ca_params, other_ca_key);
+    let second_leaf = support::issue_server_cert(&other_issuer, "*.s3.test");
+
+    let reloadable = ReloadableConfig::start(TlsConfig {
+        cert_chain_path: chain_path.clone(),
+        private_key_path: key_path.clone(),
+        client_ca_path: None,
+    })
+    .expect("start reloadable config");
+
+    // Initially, only the first CA's client trusts the served cert.
+    handshake_ok(reloadable.current(), client_config_trusting(&ca_pem), "bucket.s3.test").await;
+
+    // Rewrite the cert file with a leaf signed by a *different* CA.
+    std::fs::write(&chain_path, format!("{}{}", second_leaf.cert_pem, other_ca_pem)).expect("rewrite chain file");
+    std::fs::write(&key_path, &second_leaf.key_pem).expect("rewrite key file");
+
+    // Poll until the swap is observed — file watcher delivery timing isn't guaranteed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let acceptor = TlsAcceptor::from(reloadable.current());
+        let connector = TlsConnector::from(Arc::new(client_config_trusting(&other_ca_pem)));
+        let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
+        let (server_result, client_result) =
+            tokio::join!(acceptor.accept(server_io), connector.connect(name, client_io));
+        if server_result.is_ok() && client_result.is_ok() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

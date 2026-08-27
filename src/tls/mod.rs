@@ -8,6 +8,9 @@ use rustls::ServerConfig;
 mod identity;
 pub use identity::extract_email_identity;
 
+mod reload;
+pub use reload::ReloadableConfig;
+
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub cert_chain_path: PathBuf,
