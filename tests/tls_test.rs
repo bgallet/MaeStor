@@ -2,10 +2,13 @@ mod support;
 
 use std::sync::Arc;
 
+use open_conductor::routing::RoutingConfig;
 use open_conductor::tls::{load_server_config, ReloadableConfig, TlsConfig};
 use rcgen::Issuer;
 use rustls::pki_types::ServerName;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tracing_test::traced_test;
 
 fn client_config_trusting(ca_pem: &str) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
@@ -217,6 +220,197 @@ async fn reload_picks_up_a_rotated_certificate() {
         let (server_result, client_result) =
             tokio::join!(acceptor.accept(server_io), connector.connect(name, client_io));
         if server_result.is_ok() && client_result.is_ok() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn start_tls_server(tls_config: TlsConfig, routing: RoutingConfig) -> open_conductor::ServerHandle {
+    open_conductor::serve_tls("127.0.0.1:0".parse().unwrap(), routing, tls_config)
+        .await
+        .expect("server should bind")
+}
+
+async fn send_tls_request(
+    addr: std::net::SocketAddr,
+    client_config: Arc<rustls::ClientConfig>,
+    sni: &str,
+    request: &str,
+) -> String {
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let connector = TlsConnector::from(client_config);
+    let name = ServerName::try_from(sni.to_string()).expect("valid server name");
+    let mut tls = connector.connect(name, tcp).await.expect("tls handshake");
+
+    tls.write_all(request.as_bytes()).await.expect("write");
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.expect("read");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[tokio::test]
+async fn serve_tls_handshakes_and_answers_over_a_wildcard_cert() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path, private_key_path: key_path, client_ca_path: None },
+        RoutingConfig::default(),
+    )
+    .await;
+
+    let response = send_tls_request(
+        handle.addr(),
+        Arc::new(client_config_trusting(&ca_pem)),
+        "bucket.s3.test",
+        "GET / HTTP/1.1\r\nHost: bucket.s3.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains("ListAllMyBucketsResult"));
+}
+
+#[traced_test]
+#[tokio::test]
+async fn serve_tls_with_client_cert_resolves_identity_from_the_certificate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let client_cert = support::issue_client_cert(&issuer, "alice@example.com");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path, private_key_path: key_path, client_ca_path: Some(client_ca_path) },
+        RoutingConfig::default(),
+    )
+    .await;
+
+    let client_config = Arc::new(client_config_with_cert(&ca_pem, &client_cert.cert_pem, &client_cert.key_pem));
+
+    // The Authorization header names a *different* user; if the cert
+    // identity weren't taking priority, that's who would be logged.
+    let request = "GET / HTTP/1.1\r\nHost: bucket.s3.test\r\nAuthorization: AWS4-HMAC-SHA256 Credential=AKIAOTHER/20260814/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123\r\nConnection: close\r\n\r\n";
+    let response = send_tls_request(handle.addr(), client_config, "bucket.s3.test", request).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(logs_contain("alice@example.com"));
+    assert!(!logs_contain("AKIAOTHER"));
+}
+
+#[tokio::test]
+async fn serve_tls_rejects_a_client_cert_from_an_untrusted_ca() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &leaf);
+    let client_ca_path = support::write_pem(dir.path(), "client_ca.pem", &ca_pem);
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path, private_key_path: key_path, client_ca_path: Some(client_ca_path) },
+        RoutingConfig::default(),
+    )
+    .await;
+
+    let (_other_ca_pem, other_ca_params, other_ca_key) = support::generate_ca();
+    let other_issuer = Issuer::from_params(&other_ca_params, other_ca_key);
+    let untrusted_client_cert = support::issue_client_cert(&other_issuer, "mallory@example.com");
+    // The client trusts the *real* server CA (`ca_pem`), not the untrusted
+    // cert's own issuer (`other_ca_pem`). If the client instead trusted
+    // `other_ca_pem`, it would reject the *server's* certificate (signed by
+    // `ca_pem`) as untrusted, and the handshake would fail on the client's
+    // root-store check before the server's mTLS verifier ever evaluated the
+    // client's certificate — the assertion below would then pass for the
+    // wrong reason. Trusting `ca_pem` isolates the failure to the server's
+    // mTLS verifier rejecting the client cert, which is what this test
+    // claims to prove.
+    let client_config = Arc::new(client_config_with_cert(
+        &ca_pem,
+        &untrusted_client_cert.cert_pem,
+        &untrusted_client_cert.key_pem,
+    ));
+
+    let tcp = tokio::net::TcpStream::connect(handle.addr()).await.expect("connect");
+    let connector = TlsConnector::from(client_config);
+    let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
+
+    // In TLS 1.3, client-certificate auth completes the *client's* side of
+    // the handshake as soon as it has sent its own Finished message — the
+    // client does not wait to learn whether the server accepted its
+    // certificate before `connect()` resolves. So `connect()` can return
+    // `Ok` even though the server is about to reject the connection: the
+    // rejection only surfaces once the client tries to exchange data and
+    // gets the server's fatal alert (verified empirically: `connect()`
+    // succeeds here, and the following read fails with
+    // `AlertReceived(DecryptError)`). A bare `connector.connect(...).is_err()`
+    // check (as an earlier draft of this test used) is therefore not
+    // sufficient — it can pass on some runs and fail on others depending on
+    // exactly how much of the handshake has completed when `connect()`
+    // resolves. Instead, treat either an immediate handshake error or a
+    // failed request/response round trip as proof of rejection.
+    match connector.connect(name, tcp).await {
+        Err(_) => {}
+        Ok(mut tls) => {
+            let request = "GET / HTTP/1.1\r\nHost: bucket.s3.test\r\nConnection: close\r\n\r\n";
+            let mut response = Vec::new();
+            let outcome = async {
+                tls.write_all(request.as_bytes()).await?;
+                tls.read_to_end(&mut response).await
+            }
+            .await;
+            assert!(
+                outcome.is_err() || response.is_empty(),
+                "expected the connection to be rejected, but got a response: {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn serve_tls_reloads_a_rotated_certificate_without_restarting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ca_pem, ca_params, ca_key) = support::generate_ca();
+    let issuer = Issuer::from_params(&ca_params, ca_key);
+    let first_leaf = support::issue_server_cert(&issuer, "*.s3.test");
+    let (chain_path, key_path) = support::write_chain_and_key(dir.path(), &ca_pem, &first_leaf);
+
+    let (other_ca_pem, other_ca_params, other_ca_key) = support::generate_ca();
+    let other_issuer = Issuer::from_params(&other_ca_params, other_ca_key);
+    let second_leaf = support::issue_server_cert(&other_issuer, "*.s3.test");
+
+    let handle = start_tls_server(
+        TlsConfig { cert_chain_path: chain_path.clone(), private_key_path: key_path.clone(), client_ca_path: None },
+        RoutingConfig::default(),
+    )
+    .await;
+
+    let response = send_tls_request(
+        handle.addr(),
+        Arc::new(client_config_trusting(&ca_pem)),
+        "bucket.s3.test",
+        "GET / HTTP/1.1\r\nHost: bucket.s3.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"));
+
+    std::fs::write(&chain_path, format!("{}{}", second_leaf.cert_pem, other_ca_pem)).expect("rewrite chain file");
+    std::fs::write(&key_path, &second_leaf.key_pem).expect("rewrite key file");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let tcp = tokio::net::TcpStream::connect(handle.addr()).await.expect("connect");
+        let connector = TlsConnector::from(Arc::new(client_config_trusting(&other_ca_pem)));
+        let name = ServerName::try_from("bucket.s3.test".to_string()).expect("valid server name");
+        if connector.connect(name, tcp).await.is_ok() {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "reload was not observed within the timeout");

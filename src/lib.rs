@@ -159,3 +159,80 @@ pub async fn serve(
         join_handle,
     })
 }
+
+pub async fn serve_tls(
+    addr: SocketAddr,
+    routing_config: routing::RoutingConfig,
+    tls_config: tls::TlsConfig,
+) -> Result<ServerHandle, tls::TlsError> {
+    let listener = TcpListener::bind(addr).await.map_err(tls::TlsError::Io)?;
+    let local_addr = listener.local_addr().map_err(tls::TlsError::Io)?;
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let graceful = GracefulShutdown::new();
+    let routing_config = std::sync::Arc::new(routing_config);
+    let reloadable = std::sync::Arc::new(tls::ReloadableConfig::start(tls_config)?);
+
+    let join_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, _) = match accept_result {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            tracing::error!(error = %err, "accept error");
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    let watcher = graceful.watcher();
+                    let routing_config = std::sync::Arc::clone(&routing_config);
+                    let reloadable = std::sync::Arc::clone(&reloadable);
+                    tokio::spawn(async move {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(reloadable.current());
+                        let tls_stream = match acceptor.accept(stream).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "TLS handshake failed");
+                                return;
+                            }
+                        };
+
+                        let peer_identity = tls_stream
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|certs| certs.first())
+                            .and_then(|cert| tls::extract_email_identity(cert));
+
+                        let io = TokioIo::new(tls_stream);
+                        let builder = ConnBuilder::new(TokioExecutor::new());
+                        let service = service_fn(move |req| {
+                            let routing_config = std::sync::Arc::clone(&routing_config);
+                            let peer_identity = peer_identity.clone();
+                            async move {
+                                handle_request(req, &routing_config, peer_identity.as_deref()).await
+                            }
+                        });
+                        let conn = builder.serve_connection(io, service);
+                        let conn = watcher.watch(conn);
+                        if let Err(err) = conn.await {
+                            tracing::error!(error = %err, "connection error");
+                        }
+                    });
+                }
+                _ = &mut shutdown_rx => {
+                    tracing::info!("shutdown requested; no longer accepting new connections");
+                    break;
+                }
+            }
+        }
+
+        if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown()).await.is_err() {
+            tracing::warn!("graceful shutdown timed out; dropping remaining connections");
+        } else {
+            tracing::info!("all connections closed gracefully");
+        }
+    });
+
+    Ok(ServerHandle { addr: local_addr, shutdown_tx, join_handle })
+}
