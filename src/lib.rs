@@ -30,11 +30,12 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn handle_request(
     req: Request<Incoming>,
     routing_config: &routing::RoutingConfig,
+    peer_identity: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // Borrow directly from `req` rather than cloning method/path/query/headers
     // up front — nothing here needs to outlive the borrow, since `user` and
     // `parsed` are both owned before `req` is consumed below.
-    let user = auth::extract_user(req.headers());
+    let user = auth::extract_user(req.headers(), peer_identity);
     let host = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok());
     let parsed = routing::parse_request(
         req.method(),
@@ -125,7 +126,7 @@ pub async fn serve(
                         let builder = ConnBuilder::new(TokioExecutor::new());
                         let service = service_fn(move |req| {
                             let routing_config = std::sync::Arc::clone(&routing_config);
-                            async move { handle_request(req, &routing_config).await }
+                            async move { handle_request(req, &routing_config, None).await }
                         });
                         let conn = builder.serve_connection(io, service);
                         let conn = watcher.watch(conn);

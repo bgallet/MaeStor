@@ -2,7 +2,10 @@ use http::HeaderMap;
 
 pub const ANONYMOUS_USER: &str = "anonymous";
 
-pub fn extract_user(headers: &HeaderMap) -> String {
+pub fn extract_user(headers: &HeaderMap, peer_identity: Option<&str>) -> String {
+    if let Some(identity) = peer_identity {
+        return identity.to_string();
+    }
     let Some(value) = headers.get(http::header::AUTHORIZATION) else {
         return ANONYMOUS_USER.to_string();
     };
@@ -34,7 +37,7 @@ mod tests {
     #[test]
     fn missing_header_falls_back_to_anonymous() {
         let headers = HeaderMap::new();
-        assert_eq!(extract_user(&headers), ANONYMOUS_USER);
+        assert_eq!(extract_user(&headers, None), ANONYMOUS_USER);
     }
 
     #[test]
@@ -47,7 +50,7 @@ mod tests {
                  SignedHeaders=host;x-amz-date, Signature=abc123",
             ),
         );
-        assert_eq!(extract_user(&headers), "AKIAEXAMPLE");
+        assert_eq!(extract_user(&headers, None), "AKIAEXAMPLE");
     }
 
     #[test]
@@ -57,6 +60,25 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("not-a-sigv4-header"),
         );
-        assert_eq!(extract_user(&headers), ANONYMOUS_USER);
+        assert_eq!(extract_user(&headers, None), ANONYMOUS_USER);
+    }
+
+    #[test]
+    fn client_cert_identity_takes_priority_over_signature_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260814/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=abc123",
+            ),
+        );
+        assert_eq!(extract_user(&headers, Some("alice@example.com")), "alice@example.com");
+    }
+
+    #[test]
+    fn missing_peer_identity_falls_back_to_header_parsing() {
+        let empty = HeaderMap::new();
+        assert_eq!(extract_user(&empty, None), ANONYMOUS_USER);
     }
 }
