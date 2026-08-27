@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use open_conductor::routing::RoutingConfig;
-use open_conductor::tls::TlsConfig;
+use maestore::routing::RoutingConfig;
+use maestore::tls::TlsConfig;
 
 const BIND_ADDR_ENV_VAR: &str = "OPEN_CONDUCTOR_ADDR";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
@@ -67,7 +67,7 @@ fn half_configured_tls_error(set: &str, missing: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    open_conductor::logging::init();
+    maestore::logging::init();
 
     let addr: SocketAddr = std::env::var(BIND_ADDR_ENV_VAR)
         .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
@@ -84,8 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
 
     let handle = match tls_config {
-        Some(tls_config) => open_conductor::serve_tls(addr, routing_config, tls_config).await?,
-        None => open_conductor::serve(addr, routing_config).await?,
+        Some(tls_config) => maestore::serve_tls(addr, routing_config, tls_config).await?,
+        None => maestore::serve(addr, routing_config).await?,
     };
 
     tracing::info!(addr = %handle.addr(), "listening");

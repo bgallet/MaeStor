@@ -1,5 +1,5 @@
 [package]
-name = "open-conductor"
+name = "maestore"
 version = "0.1.0"
 edition = "2021"
 
