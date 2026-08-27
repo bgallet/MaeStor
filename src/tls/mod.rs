@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
+mod identity;
+pub use identity::extract_email_identity;
+
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub cert_chain_path: PathBuf,

@@ -602,6 +602,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "x509-parser",
 ]
 
 [[package]]
