@@ -129,8 +129,11 @@ binary frame:
 
 | first byte | rest | meaning |
 |---|---|---|
-| `0x00` | `key` bytes | resume at `key >= <key>` (inclusive key, no version) |
-| `0x01` | 8-byte big-endian `id`, then `key` bytes | resume strictly after the row `(<key>, <id>)` |
+| `0x00` | the UTF-8 `key` | resume at `key >= <key>` (inclusive key, no version) |
+| `0x01` | 8-byte big-endian `id`, then the UTF-8 `key` | resume strictly after the row `(<key>, <id>)` |
+
+The `key` portion is bound to the query as a `TEXT` parameter, so decode
+rejects a non-UTF-8 key portion as `InvalidCursor`.
 
 `base64` is already a transitive dependency; this promotes it to a direct one
 (`base64 = "0.22"` in `Cargo.toml`). The tag byte keeps decoding unambiguous
@@ -157,15 +160,19 @@ by the prefix lower bound (no error).
 
 ### `prefix_successor`
 
-The shortest byte string strictly greater than every string that has `s` as a
-prefix: clone `s`, then from the last byte, increment it; if it is `0xFF`, drop
-it and carry to the previous byte; if every byte was `0xFF` (or `s` is empty),
-there is no successor — return `None`, meaning "no upper bound" (scan to the
-end of the bucket).
+`fn prefix_successor(prefix: &str) -> Option<String>` — the shortest string
+strictly greater than every string beginning with `prefix`, in SQLite `TEXT`
+order (which for UTF-8 is bytewise, which is codepoint order). Works on
+**characters, not bytes**, so the result is always valid UTF-8 and can be bound
+as a `TEXT` parameter: pop the last `char`, increment its codepoint (stepping
+`U+D7FF → U+E000` over the surrogate gap); if it was `char::MAX`, drop it and
+carry to the previous `char`; if `prefix` is empty or all `char::MAX`, return
+`None` ("no upper bound — scan to the end of the bucket").
 
-This is a free function with unit tests, living beside `encode_content_type` in
-`src/metadata/sqlite/mod.rs`. (It is SQLite-agnostic, but SQLite is its only
-user for now; promote it to `metadata` if a second backend needs it.)
+Used for the query's `key <` upper bound and for the post-common-prefix resume
+cursor. A free function with unit tests, beside `encode_content_type` in
+`src/metadata/sqlite/mod.rs`. (SQLite-agnostic; promote to `metadata` if a
+second backend needs it.)
 
 ## SQLite implementation (`src/metadata/sqlite/mod.rs`)
 
