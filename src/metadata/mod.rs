@@ -9,7 +9,10 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-pub use types::{CacheControl, ContentType, DataEncryptionContext, Etag, ObjectStorageClass, ObjectVersion};
+pub use types::{
+    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ObjectStorageClass,
+    ObjectVersion,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metadata {
@@ -106,7 +109,7 @@ mod tests {
             backend_id: 1,
             bucket: "my-bucket".to_string(),
             key: "my-key".to_string(),
-            content_type: Some(ContentType("text/plain".to_string())),
+            content_type: Some(ContentType::parse("text/plain")),
             content_disposition: None,
             content_language: None,
             version: ObjectVersion("v1".to_string()),

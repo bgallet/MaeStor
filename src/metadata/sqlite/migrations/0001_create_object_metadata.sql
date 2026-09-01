@@ -8,7 +8,10 @@ CREATE TABLE object_metadata (
     size INTEGER NOT NULL,
     cache_control TEXT NOT NULL,
     backend_id INTEGER NOT NULL,
-    content_type TEXT,
+    -- NULL, or a single byte holding a KnownContentType code, or the UTF-8
+    -- bytes of an unrecognized MIME string (always 2+ bytes, since no valid
+    -- MIME type is one character).
+    content_type BLOB,
     content_disposition TEXT,
     content_language TEXT,
     cloned_at INTEGER,

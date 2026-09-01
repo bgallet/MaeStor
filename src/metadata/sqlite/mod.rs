@@ -7,8 +7,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, Metadata, MetadataError, MetadataStore,
-    ObjectStorageClass, ObjectVersion,
+    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, Metadata,
+    MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
 };
 
 pub struct SqliteMetadataStore {
@@ -75,6 +75,44 @@ fn millis_to_system_time(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis as u64)
 }
 
+/// Encodes a content type for the `content_type` BLOB column: a known type is
+/// its one-byte code, anything else is its raw UTF-8. An `Other` shorter than
+/// two bytes is rejected — it could not be told apart from a known-type code
+/// on the way back out.
+fn encode_content_type(content_type: &ContentType) -> Result<Vec<u8>, MetadataError> {
+    match content_type {
+        ContentType::Known(known) => Ok(vec![known.code()]),
+        ContentType::Other(value) if value.len() >= 2 => Ok(value.clone().into_bytes()),
+        ContentType::Other(value) => Err(MetadataError::Corrupt {
+            field: "content_type",
+            detail: format!("content type {value:?} is too short to store unambiguously"),
+        }),
+    }
+}
+
+/// Inverse of [`encode_content_type`]. The caller maps a NULL column to `None`
+/// before calling this.
+fn decode_content_type(bytes: Vec<u8>) -> Result<ContentType, MetadataError> {
+    match bytes.as_slice() {
+        [code] => KnownContentType::from_code(*code)
+            .map(ContentType::Known)
+            .ok_or_else(|| MetadataError::Corrupt {
+                field: "content_type",
+                detail: format!("unassigned known content-type code {code}"),
+            }),
+        [] => Err(MetadataError::Corrupt {
+            field: "content_type",
+            detail: "stored content type is empty".to_string(),
+        }),
+        _ => String::from_utf8(bytes)
+            .map(ContentType::Other)
+            .map_err(|err| MetadataError::Corrupt {
+                field: "content_type",
+                detail: err.to_string(),
+            }),
+    }
+}
+
 fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
     let storage_class_text: String = row
         .try_get("storage_class")
@@ -136,9 +174,10 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
         bucket: row.try_get("bucket").map_err(MetadataError::Backend)?,
         key: row.try_get("key").map_err(MetadataError::Backend)?,
         content_type: row
-            .try_get::<Option<String>, _>("content_type")
+            .try_get::<Option<Vec<u8>>, _>("content_type")
             .map_err(MetadataError::Backend)?
-            .map(ContentType),
+            .map(decode_content_type)
+            .transpose()?,
         content_disposition: row
             .try_get("content_disposition")
             .map_err(MetadataError::Backend)?,
@@ -181,6 +220,12 @@ where
         .map(|time| system_time_to_millis(time, "cloned_at"))
         .transpose()?;
 
+    let content_type_blob = metadata
+        .content_type
+        .as_ref()
+        .map(encode_content_type)
+        .transpose()?;
+
     sqlx::query(
         "INSERT INTO object_metadata
          (bucket, key, version, etag, last_modified, size, cache_control, backend_id,
@@ -212,7 +257,7 @@ where
     .bind(metadata.size as i64)
     .bind(&metadata.cache_control.0)
     .bind(metadata.backend_id as i64)
-    .bind(metadata.content_type.as_ref().map(|c| c.0.as_str()))
+    .bind(content_type_blob)
     .bind(metadata.content_disposition.as_deref())
     .bind(metadata.content_language.as_deref())
     .bind(cloned_at_millis)
@@ -507,7 +552,7 @@ mod tests {
         .bind(42i64)
         .bind("no-cache")
         .bind(1i64)
-        .bind(Some("text/plain"))
+        .bind(Some(vec![KnownContentType::TextPlain.code()]))
         .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind(Some(1_700_000_001_000i64))
@@ -535,7 +580,7 @@ mod tests {
         assert_eq!(metadata.size, 42);
         assert_eq!(
             metadata.content_type,
-            Some(ContentType("text/plain".to_string()))
+            Some(ContentType::Known(KnownContentType::TextPlain))
         );
         assert_eq!(metadata.content_disposition, None);
         assert_eq!(
@@ -589,5 +634,74 @@ mod tests {
             .expect("row should be found");
 
         assert!(row_to_metadata(&row).is_err());
+    }
+
+    #[tokio::test]
+    async fn row_to_metadata_rejects_a_single_byte_content_type_with_no_assigned_code() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+
+        sqlx::query(
+            "INSERT INTO object_metadata
+             (bucket, key, version, etag, last_modified, size, cache_control, backend_id,
+              content_type, content_disposition, content_language, cloned_at, upload_id,
+              is_latest, delete_marker, user_metadata, storage_class, encryption_context)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("b")
+        .bind("k")
+        .bind("v1")
+        .bind(b"etag".to_vec())
+        .bind(0i64)
+        .bind(0i64)
+        .bind("")
+        .bind(0i64)
+        .bind(Some(vec![250u8]))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<i64>::None)
+        .bind(Option::<Vec<u8>>::None)
+        .bind(1i64)
+        .bind(0i64)
+        .bind("{}")
+        .bind("STANDARD")
+        .bind(Option::<String>::None)
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        let row = sqlx::query("SELECT * FROM object_metadata WHERE bucket = 'b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+
+        let err = row_to_metadata(&row).expect_err("an unassigned code should not decode");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "content_type", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn encode_content_type_rejects_an_other_too_short_to_disambiguate() {
+        let err = encode_content_type(&ContentType::Other("x".to_string()))
+            .expect_err("a one-byte Other should be rejected");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "content_type", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn content_type_blob_round_trips_both_variants() {
+        for content_type in [
+            ContentType::Known(KnownContentType::ImagePng),
+            ContentType::Other("application/vnd.acme+xml".to_string()),
+        ] {
+            let encoded = encode_content_type(&content_type).expect("encode should succeed");
+            assert_eq!(
+                decode_content_type(encoded).expect("decode should succeed"),
+                content_type
+            );
+        }
     }
 }

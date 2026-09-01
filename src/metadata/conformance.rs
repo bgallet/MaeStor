@@ -40,7 +40,7 @@ pub(crate) fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadat
         backend_id: 1,
         bucket: bucket.to_string(),
         key: key.to_string(),
-        content_type: Some(ContentType("text/plain".to_string())),
+        content_type: Some(ContentType::parse("text/plain")),
         content_disposition: None,
         content_language: None,
         version: ObjectVersion(version.to_string()),
@@ -476,7 +476,8 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
         backend_id: 7,
         bucket: "b".to_string(),
         key: "deep/key/name".to_string(),
-        content_type: Some(ContentType("application/json".to_string())),
+        // Exact match — round-trips through the one-byte known-type code.
+        content_type: Some(ContentType::parse("application/json")),
         content_disposition: Some("attachment; filename=\"x.json\"".to_string()),
         content_language: Some("en-US".to_string()),
         version: ObjectVersion("v1".to_string()),
@@ -506,6 +507,23 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
         .expect("get should succeed")
         .expect("a row should be found");
     assert_eq!(found, expected);
+}
+
+pub(crate) async fn an_unknown_content_type_round_trips_verbatim(store: impl MetadataStore) {
+    let mut metadata = sample_metadata("b", "k", "v1");
+    metadata.content_type = Some(ContentType::Other("application/vnd.acme+special".to_string()));
+
+    store
+        .put_versioned(metadata.clone())
+        .await
+        .expect("put should succeed");
+
+    let found = store
+        .get("b", "k", None)
+        .await
+        .expect("get should succeed")
+        .expect("a row should be found");
+    assert_eq!(found.content_type, metadata.content_type);
 }
 
 pub(crate) async fn metadata_store_is_object_safe(store: impl MetadataStore + 'static) {
@@ -586,6 +604,7 @@ macro_rules! metadata_store_conformance {
             case!($make_store, put_rejects_a_pre_epoch_last_modified);
             case!($make_store, put_rejects_a_pre_epoch_cloned_at);
             case!($make_store, all_fields_round_trip);
+            case!($make_store, an_unknown_content_type_round_trips_verbatim);
             case!($make_store, metadata_store_is_object_safe);
         }
     };
