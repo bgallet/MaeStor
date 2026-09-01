@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod conformance;
 pub mod sqlite;
 pub mod types;
 
