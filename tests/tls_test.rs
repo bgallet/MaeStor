@@ -3,8 +3,8 @@ mod support;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use maestore::routing::RoutingConfig;
-use maestore::tls::{load_server_config, ReloadableConfig, TlsConfig};
+use maestor::routing::RoutingConfig;
+use maestor::tls::{load_server_config, ReloadableConfig, TlsConfig};
 use rcgen::Issuer;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -290,8 +290,8 @@ async fn reloadable_config_starts_with_bare_filename_paths() {
     handshake_ok(reloadable.current(), client_config_trusting(&ca_pem), "bucket.s3.test").await;
 }
 
-async fn start_tls_server(tls_config: TlsConfig, routing: RoutingConfig) -> maestore::ServerHandle {
-    maestore::serve_tls("127.0.0.1:0".parse().unwrap(), routing, tls_config)
+async fn start_tls_server(tls_config: TlsConfig, routing: RoutingConfig) -> maestor::ServerHandle {
+    maestor::serve_tls("127.0.0.1:0".parse().unwrap(), routing, tls_config)
         .await
         .expect("server should bind")
 }

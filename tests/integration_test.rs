@@ -1,15 +1,15 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
-use maestore::routing::RoutingConfig;
-use maestore::ServerHandle;
+use maestor::routing::RoutingConfig;
+use maestor::ServerHandle;
 
 async fn start_server() -> ServerHandle {
     start_server_with_routing(RoutingConfig::default()).await
 }
 
 async fn start_server_with_routing(routing: RoutingConfig) -> ServerHandle {
-    maestore::serve("127.0.0.1:0".parse().unwrap(), routing)
+    maestor::serve("127.0.0.1:0".parse().unwrap(), routing)
         .await
         .expect("server should bind")
 }
