@@ -142,10 +142,10 @@ SQLite's `rowid`; it is read off the batch row for cursor construction and is
 **not** added to `Metadata`. Leaking it inside an opaque token is acceptable
 (another backend encodes whatever its own resume needs).
 
-- `list`: `next_cursor` frames are always tag `0x00` (`key` alone is a
-  sufficient sort key for the latest-only scan).
-- `list_versions`: after a returned row, tag `0x01` with that row's `(key,
-  id)`. After a rolled-up common prefix, tag `0x00` with
+- After a returned row: tag `0x01` with that row's `(key, id)`. `list_versions`
+  needs the `id` for its within-key tiebreak; `list`'s latest-only scan
+  ignores it and resumes on `key >` alone (one row per key).
+- After a rolled-up common prefix: tag `0x00` with
   `prefix_successor(common_prefix)`.
 
 "Scan position" — not "last returned item" — is the point. When a page ends on
@@ -265,8 +265,9 @@ return ListPage { items, common_prefixes, next_cursor: None }
 ```
 
 - `pos` is both the scan position and, on a truncated page, what
-  `next_cursor` encodes. `AtKey` → tag `0x00`; `AfterRow` → tag `0x00` for
-  `list` (key alone suffices) and tag `0x01` for `list_versions`.
+  `next_cursor` encodes: `AtKey` → tag `0x00`, `AfterRow` → tag `0x01` (both
+  operations). `list_batch` for the latest-only scan binds only `key > ?` from
+  an `AfterRow`, ignoring the `id`.
 - `BATCH_SIZE` is `min(max_keys, 1000).max(1)` — a bounded fetch window so a
   delimiter-heavy scan never pulls an unbounded result set; the loop re-queries
   as needed.
