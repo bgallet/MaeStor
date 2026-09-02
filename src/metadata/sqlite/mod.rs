@@ -196,6 +196,19 @@ impl Pos {
     }
 }
 
+/// If `key` (already known to start with `prefix`) contains `delimiter`
+/// somewhere after `prefix`, returns the common prefix it rolls up into:
+/// `prefix` plus everything through that first delimiter. `None` means `key`
+/// is a plain item.
+// Wired up by list_page in a later task; annotated so clippy --all-targets
+// stays clean until then.
+#[allow(dead_code)]
+fn delimiter_group(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    let rest = &key[prefix.len()..];
+    let idx = rest.find(delimiter)?;
+    Some(format!("{prefix}{}", &rest[..idx + delimiter.len()]))
+}
+
 // Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
 #[allow(dead_code)]
 fn decode_cursor_key(bytes: &[u8]) -> Result<String, MetadataError> {
@@ -829,6 +842,23 @@ mod tests {
                 "expected InvalidCursor for {bad:?}",
             );
         }
+    }
+
+    #[test]
+    fn delimiter_group_rolls_up_a_key_containing_the_delimiter() {
+        assert_eq!(delimiter_group("photos/jan/a", "", "/").as_deref(), Some("photos/"));
+        assert_eq!(delimiter_group("p/sub/a", "p/", "/").as_deref(), Some("p/sub/"));
+    }
+
+    #[test]
+    fn delimiter_group_is_none_for_a_plain_key() {
+        assert_eq!(delimiter_group("photos", "", "/"), None);
+        assert_eq!(delimiter_group("p/x", "p/", "/"), None);
+    }
+
+    #[test]
+    fn delimiter_group_supports_a_multi_char_delimiter() {
+        assert_eq!(delimiter_group("aXXbXXc", "", "XX").as_deref(), Some("aXX"));
     }
 
     #[test]
