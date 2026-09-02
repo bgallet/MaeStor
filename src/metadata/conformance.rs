@@ -447,6 +447,73 @@ pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl Metadat
     assert_eq!(page.next_cursor, None);
 }
 
+pub(crate) async fn list_groups_keys_under_a_delimiter(store: impl MetadataStore) {
+    for key in ["a", "p/1", "p/2", "q/1", "z"] {
+        store
+            .put_versioned(sample_metadata("b", key, "v1"))
+            .await
+            .expect("put should succeed");
+    }
+
+    let (items, common_prefixes) =
+        collect_all(&store, "b", false, None, Some("/"), 1000).await;
+    let keys: Vec<_> = items.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(keys, vec!["a", "z"]);
+    assert_eq!(common_prefixes, vec!["p/".to_string(), "q/".to_string()]);
+}
+
+pub(crate) async fn list_delimiter_respects_prefix(store: impl MetadataStore) {
+    for key in ["p/x", "p/sub/a", "p/sub/b"] {
+        store
+            .put_versioned(sample_metadata("b", key, "v1"))
+            .await
+            .expect("put should succeed");
+    }
+
+    let (items, common_prefixes) =
+        collect_all(&store, "b", false, Some("p/"), Some("/"), 1000).await;
+    let keys: Vec<_> = items.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(keys, vec!["p/x"]);
+    assert_eq!(common_prefixes, vec!["p/sub/".to_string()]);
+}
+
+pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl MetadataStore) {
+    for key in ["g/1", "g/2", "g/3", "g/4", "z"] {
+        store
+            .put_versioned(sample_metadata("b", key, "v1"))
+            .await
+            .expect("put should succeed");
+    }
+
+    let page1 = store
+        .list(
+            "b",
+            ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 1 },
+        )
+        .await
+        .expect("list should succeed");
+    assert_eq!(page1.items, Vec::new());
+    assert_eq!(page1.common_prefixes, vec!["g/".to_string()]);
+    let cursor = page1.next_cursor.expect("more remains after the group");
+
+    let page2 = store
+        .list(
+            "b",
+            ListParams {
+                prefix: None,
+                delimiter: Some("/"),
+                cursor: Some(&cursor),
+                max_keys: 10,
+            },
+        )
+        .await
+        .expect("list should succeed");
+    let keys: Vec<_> = page2.items.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(keys, vec!["z"], "resumes past the whole group");
+    assert_eq!(page2.common_prefixes, Vec::<String>::new());
+    assert_eq!(page2.next_cursor, None);
+}
+
 pub(crate) async fn list_buckets_returns_distinct_bucket_names(store: impl MetadataStore) {
     store
         .put_versioned(sample_metadata("bucket-b", "k", "v1"))
@@ -693,6 +760,9 @@ macro_rules! metadata_store_conformance {
             case!($make_store, list_paginates_and_reports_truncation);
             case!($make_store, list_final_exact_page_has_no_next_cursor);
             case!($make_store, list_of_an_empty_bucket_is_an_empty_page);
+            case!($make_store, list_groups_keys_under_a_delimiter);
+            case!($make_store, list_delimiter_respects_prefix);
+            case!($make_store, list_delimiter_page_ends_on_a_common_prefix);
             case!($make_store, list_buckets_returns_distinct_bucket_names);
             case!(
                 $make_store,
