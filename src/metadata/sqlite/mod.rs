@@ -970,4 +970,49 @@ mod tests {
             );
         }
     }
+
+    async fn query_plan(store: &SqliteMetadataStore, sql: &str) -> String {
+        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .fetch_all(&store.pool)
+            .await
+            .expect("EXPLAIN QUERY PLAN should run");
+        rows.iter()
+            .map(|r| r.try_get::<String, _>("detail").expect("detail column"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn list_batch_query_plan_uses_the_partial_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let plan = query_plan(
+            &store,
+            "SELECT * FROM object_metadata WHERE bucket = 'b' AND key >= 'p/' \
+             AND key < 'p0' AND is_latest = 1 ORDER BY key LIMIT 100",
+        )
+        .await;
+        // SEARCH = a bounded index probe; a full table scan reads "SCAN
+        // object_metadata" with no "USING INDEX".
+        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
+        assert!(
+            plan.contains("USING INDEX idx_object_metadata_one_latest"),
+            "expected the partial index, got:\n{plan}",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_versions_batch_query_plan_uses_an_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let plan = query_plan(
+            &store,
+            "SELECT * FROM object_metadata WHERE bucket = 'b' AND key >= 'p/' \
+             AND key < 'p0' ORDER BY key, id DESC LIMIT 100",
+        )
+        .await;
+        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
+        assert!(
+            plan.contains("USING INDEX idx_object_metadata_bucket_key_is_latest"),
+            "expected the bucket/key index, got:\n{plan}",
+        );
+    }
 }
