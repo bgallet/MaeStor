@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, Metadata, MetadataError, MetadataStore,
-    ObjectStorageClass, ObjectVersion,
+    CacheControl, ContentType, DataEncryptionContext, Etag, ListPage, ListParams, Metadata,
+    MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
 };
 
 /// A metadata record with every optional field left empty, for tests that only
@@ -54,13 +54,48 @@ pub(crate) fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadat
     }
 }
 
-/// Every stored version for one key, newest-first, via the public API — the
-/// trait-level stand-in for "how many rows are on disk for this key".
+/// Drains every page of a list operation into flat vectors. Requires
+/// `page_size >= 1`.
+async fn collect_all(
+    store: &impl MetadataStore,
+    bucket: &str,
+    versions: bool,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    page_size: usize,
+) -> (Vec<Metadata>, Vec<String>) {
+    assert!(page_size >= 1, "collect_all needs a positive page size");
+    let mut items = Vec::new();
+    let mut common_prefixes = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let params = ListParams {
+            prefix,
+            delimiter,
+            cursor: cursor.as_deref(),
+            max_keys: page_size,
+        };
+        let page: ListPage = if versions {
+            store.list_versions(bucket, params).await
+        } else {
+            store.list(bucket, params).await
+        }
+        .expect("list should succeed");
+
+        items.extend(page.items);
+        common_prefixes.extend(page.common_prefixes);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    (items, common_prefixes)
+}
+
+/// Every stored version for one key, newest-first, via the public API.
 async fn versions_for_key(store: &impl MetadataStore, bucket: &str, key: &str) -> Vec<Metadata> {
-    let mut versions = store
-        .list_versions(bucket, None)
-        .await
-        .expect("list_versions should succeed");
+    let (mut versions, _) = collect_all(store, bucket, true, None, None, 1000).await;
     versions.retain(|m| m.key == key);
     versions
 }
@@ -279,7 +314,7 @@ pub(crate) async fn list_returns_latest_rows_for_a_bucket(store: impl MetadataSt
         .await
         .expect("put should succeed");
 
-    let listed = store.list("b", None).await.expect("list should succeed");
+    let (listed, _) = collect_all(&store, "b", false, None, None, 2).await;
     assert_eq!(listed.len(), 2);
     let versions: Vec<_> = listed.iter().map(|m| m.version.0.as_str()).collect();
     assert_eq!(versions, vec!["v2", "v1"]);
@@ -299,10 +334,7 @@ pub(crate) async fn list_filters_by_prefix(store: impl MetadataStore) {
         .await
         .expect("put should succeed");
 
-    let listed = store
-        .list("b", Some("docs/"))
-        .await
-        .expect("list should succeed");
+    let (listed, _) = collect_all(&store, "b", false, Some("docs/"), None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["docs/a", "docs/b"]);
 }
@@ -319,10 +351,7 @@ pub(crate) async fn list_prefix_does_not_treat_percent_or_underscore_as_wildcard
         .await
         .expect("put should succeed");
 
-    let listed = store
-        .list("b", Some("100%"))
-        .await
-        .expect("list should succeed");
+    let (listed, _) = collect_all(&store, "b", false, Some("100%"), None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["100%_off"]);
 }
@@ -339,10 +368,7 @@ pub(crate) async fn list_versions_returns_every_version_including_markers(
         .await
         .expect("delete should succeed");
 
-    let versions = store
-        .list_versions("b", None)
-        .await
-        .expect("list_versions should succeed");
+    let (versions, _) = collect_all(&store, "b", true, None, None, 1000).await;
     let version_ids: Vec<_> = versions.iter().map(|m| m.version.0.as_str()).collect();
     // Newest-first within a key, matching S3's ListObjectVersions.
     assert_eq!(version_ids, vec!["marker1", "v1"]);
@@ -397,7 +423,7 @@ pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
         .expect("a latest row should be found");
     assert_eq!(latest.version, ObjectVersion::unversioned());
 
-    let listed = store.list("b", None).await.expect("list should succeed");
+    let (listed, _) = collect_all(&store, "b", false, None, None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["k"]);
 

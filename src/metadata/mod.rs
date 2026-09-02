@@ -119,12 +119,16 @@ pub trait MetadataStore: Send + Sync {
         version: &ObjectVersion,
     ) -> Result<(), MetadataError>;
     async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
-    async fn list(&self, bucket: &str, prefix: Option<&str>) -> Result<Vec<Metadata>, MetadataError>;
+    async fn list(
+        &self,
+        bucket: &str,
+        params: ListParams<'_>,
+    ) -> Result<ListPage, MetadataError>;
     async fn list_versions(
         &self,
         bucket: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<Metadata>, MetadataError>;
+        params: ListParams<'_>,
+    ) -> Result<ListPage, MetadataError>;
     async fn list_buckets(&self) -> Result<Vec<String>, MetadataError>;
 }
 

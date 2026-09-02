@@ -8,13 +8,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, Metadata,
-    MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
+    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ListPage, ListParams,
+    Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
 };
 
 pub struct SqliteMetadataStore {
     pool: SqlitePool,
 }
+
+/// A batch never fetches more than this many rows at once, regardless of
+/// `max_keys` — a delimiter-heavy scan re-queries as it skips groups.
+const LIST_BATCH_CAP: usize = 1000;
 
 impl SqliteMetadataStore {
     /// Connects using the given options and applies any pending migrations.
@@ -57,6 +61,147 @@ impl SqliteMetadataStore {
             .run(pool)
             .await
             .map_err(|err| MetadataError::Backend(sqlx::Error::from(err)))
+    }
+
+    /// One batch of the paged scan: rows for `bucket` with `key` in
+    /// `[lower, upper)` (lower from `prefix`/`pos`, `upper` from
+    /// `prefix_successor`), optionally `is_latest = 1`, ordered for the
+    /// operation. Returns `(key, rowid, metadata)` triples.
+    async fn list_batch(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        pos: Option<&Pos>,
+        upper: Option<&str>,
+        latest_only: bool,
+        limit: i64,
+    ) -> Result<Vec<(String, i64, Metadata)>, MetadataError> {
+        // Lower bound: the greater of the prefix and any cursor key.
+        let lower = match pos {
+            None => prefix.to_string(),
+            Some(Pos::AtKey(k)) | Some(Pos::AfterRow { key: k, .. }) => {
+                if k.as_str() > prefix { k.clone() } else { prefix.to_string() }
+            }
+        };
+
+        let mut sql = String::from(
+            "SELECT * FROM object_metadata WHERE bucket = ? AND key >= ?",
+        );
+        if upper.is_some() {
+            sql.push_str(" AND key < ?");
+        }
+        match pos {
+            Some(Pos::AfterRow { .. }) if latest_only => sql.push_str(" AND key > ?"),
+            Some(Pos::AfterRow { .. }) => {
+                sql.push_str(" AND (key > ? OR (key = ? AND id < ?))")
+            }
+            _ => {}
+        }
+        if latest_only {
+            sql.push_str(" AND is_latest = 1 ORDER BY key LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY key, id DESC LIMIT ?");
+        }
+
+        let mut query = sqlx::query(&sql).bind(bucket).bind(lower);
+        if let Some(upper) = upper {
+            query = query.bind(upper.to_string());
+        }
+        match pos {
+            Some(Pos::AfterRow { key, .. }) if latest_only => {
+                query = query.bind(key.clone());
+            }
+            Some(Pos::AfterRow { key, id }) => {
+                query = query.bind(key.clone()).bind(key.clone()).bind(*id);
+            }
+            _ => {}
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+
+        rows.iter()
+            .map(|row| {
+                let key: String = row.try_get("key").map_err(MetadataError::Backend)?;
+                let id: i64 = row.try_get("id").map_err(MetadataError::Backend)?;
+                Ok((key, id, row_to_metadata(row)?))
+            })
+            .collect()
+    }
+
+    /// The shared paging loop behind `list` and `list_versions`.
+    async fn list_page(
+        &self,
+        bucket: &str,
+        params: ListParams<'_>,
+        latest_only: bool,
+    ) -> Result<ListPage, MetadataError> {
+        let prefix = params.prefix.unwrap_or("");
+        let upper = prefix_successor(prefix);
+        let mut pos = params.cursor.map(Pos::decode).transpose()?;
+        // `max_keys` of 0 is a caller-contract violation (documented on
+        // `ListParams`); treat it as 1 rather than panic on the empty `pos`.
+        let max_keys = params.max_keys.max(1);
+        let limit = max_keys.min(LIST_BATCH_CAP) as i64;
+
+        let mut items: Vec<Metadata> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+
+        loop {
+            let batch = self
+                .list_batch(bucket, prefix, pos.as_ref(), upper.as_deref(), latest_only, limit)
+                .await?;
+            let batch_len = batch.len();
+            let mut rows = batch.into_iter().peekable();
+
+            while let Some((key, id, metadata)) = rows.next() {
+                if items.len() + common_prefixes.len() == max_keys {
+                    // `key` is a real row that would extend the result, so the
+                    // page is truncated. `pos` already points just past the
+                    // last emitted output.
+                    let cursor = pos.as_ref().expect("pos is set once an output exists");
+                    return Ok(ListPage {
+                        items,
+                        common_prefixes,
+                        next_cursor: Some(cursor.encode()),
+                    });
+                }
+
+                match params.delimiter.and_then(|d| delimiter_group(&key, prefix, d)) {
+                    Some(cp) => {
+                        common_prefixes.push(cp.clone());
+                        match prefix_successor(&cp) {
+                            Some(succ) => {
+                                // Skip the rest of this group still in the batch.
+                                while rows.peek().is_some_and(|(k, _, _)| k < &succ) {
+                                    rows.next();
+                                }
+                                pos = Some(Pos::AtKey(succ));
+                            }
+                            None => {
+                                // Nothing can sort after this group.
+                                return Ok(ListPage {
+                                    items,
+                                    common_prefixes,
+                                    next_cursor: None,
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        items.push(metadata);
+                        pos = Some(Pos::AfterRow { key, id });
+                    }
+                }
+            }
+
+            // A short batch means the range is exhausted.
+            if (batch_len as i64) < limit {
+                return Ok(ListPage { items, common_prefixes, next_cursor: None });
+            }
+        }
     }
 }
 
@@ -119,9 +264,6 @@ fn decode_content_type(bytes: Vec<u8>) -> Result<ContentType, MetadataError> {
 /// order). Operates on `char`s, so the result is always valid UTF-8 and can be
 /// bound as a `TEXT` parameter. `None` when there is no such string: `prefix`
 /// is empty or entirely `char::MAX`.
-// Wired up by `list_page` in a later task; annotated so `clippy --all-targets`
-// stays clean until then.
-#[allow(dead_code)]
 fn prefix_successor(prefix: &str) -> Option<String> {
     let mut chars: Vec<char> = prefix.chars().collect();
     while let Some(last) = chars.pop() {
@@ -141,8 +283,6 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 
 /// A scan position for the paged list queries — the decoded form of a
 /// `ListParams::cursor` and the value re-encoded into `ListPage::next_cursor`.
-// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Pos {
     /// Resume at `key >= key`. Produced by a bare-key cursor and by skipping
@@ -152,8 +292,6 @@ enum Pos {
     AfterRow { key: String, id: i64 },
 }
 
-// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
-#[allow(dead_code)]
 impl Pos {
     fn encode(&self) -> String {
         let mut frame = Vec::new();
@@ -200,17 +338,12 @@ impl Pos {
 /// somewhere after `prefix`, returns the common prefix it rolls up into:
 /// `prefix` plus everything through that first delimiter. `None` means `key`
 /// is a plain item.
-// Wired up by list_page in a later task; annotated so clippy --all-targets
-// stays clean until then.
-#[allow(dead_code)]
 fn delimiter_group(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
     let rest = &key[prefix.len()..];
     let idx = rest.find(delimiter)?;
     Some(format!("{prefix}{}", &rest[..idx + delimiter.len()]))
 }
 
-// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
-#[allow(dead_code)]
 fn decode_cursor_key(bytes: &[u8]) -> Result<String, MetadataError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| MetadataError::InvalidCursor {
         detail: "cursor key is not valid UTF-8".to_string(),
@@ -538,56 +671,20 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
-    async fn list(&self, bucket: &str, prefix: Option<&str>) -> Result<Vec<Metadata>, MetadataError> {
-        let rows = match prefix {
-            Some(prefix) => {
-                sqlx::query(
-                    "SELECT * FROM object_metadata WHERE bucket = ? AND is_latest = 1 AND key LIKE ? ESCAPE '\\' ORDER BY key",
-                )
-                .bind(bucket)
-                .bind(like_prefix_pattern(prefix))
-                .fetch_all(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "SELECT * FROM object_metadata WHERE bucket = ? AND is_latest = 1 ORDER BY key",
-                )
-                .bind(bucket)
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
-        .map_err(MetadataError::Backend)?;
-
-        rows.iter().map(row_to_metadata).collect()
+    async fn list(
+        &self,
+        bucket: &str,
+        params: ListParams<'_>,
+    ) -> Result<ListPage, MetadataError> {
+        self.list_page(bucket, params, true).await
     }
 
     async fn list_versions(
         &self,
         bucket: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<Metadata>, MetadataError> {
-        let rows = match prefix {
-            Some(prefix) => {
-                sqlx::query(
-                    "SELECT * FROM object_metadata WHERE bucket = ? AND key LIKE ? ESCAPE '\\' ORDER BY key, id DESC",
-                )
-                .bind(bucket)
-                .bind(like_prefix_pattern(prefix))
-                .fetch_all(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query("SELECT * FROM object_metadata WHERE bucket = ? ORDER BY key, id DESC")
-                    .bind(bucket)
-                    .fetch_all(&self.pool)
-                    .await
-            }
-        }
-        .map_err(MetadataError::Backend)?;
-
-        rows.iter().map(row_to_metadata).collect()
+        params: ListParams<'_>,
+    ) -> Result<ListPage, MetadataError> {
+        self.list_page(bucket, params, false).await
     }
 
     async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
@@ -599,17 +696,6 @@ impl MetadataStore for SqliteMetadataStore {
 
         Ok(rows.into_iter().map(|(bucket,)| bucket).collect())
     }
-}
-
-/// Escapes `%`/`_`/`\` in a caller-supplied prefix so `LIKE ... ESCAPE '\'`
-/// matches only literal text — without this, a key that happens to contain
-/// `%` or `_` would have those characters misread as SQL wildcards.
-fn like_prefix_pattern(prefix: &str) -> String {
-    let escaped = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    format!("{escaped}%")
 }
 
 #[cfg(test)]
