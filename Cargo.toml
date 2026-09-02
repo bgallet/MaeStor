@@ -24,6 +24,7 @@ rustls-pemfile = "2"
 x509-parser = "0.18"
 arc-swap = "1"
 notify = "8"
+base64 = "0.22"
 
 [dev-dependencies]
 tracing-test = { version = "0.2", features = ["no-env-filter"] }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
@@ -136,6 +137,71 @@ fn prefix_successor(prefix: &str) -> Option<String> {
         // `last` was char::MAX (U+10FFFF): drop it and carry to the previous char.
     }
     None
+}
+
+/// A scan position for the paged list queries — the decoded form of a
+/// `ListParams::cursor` and the value re-encoded into `ListPage::next_cursor`.
+// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pos {
+    /// Resume at `key >= key`. Produced by a bare-key cursor and by skipping
+    /// past a common-prefix group.
+    AtKey(String),
+    /// Resume strictly after the row `(key, id)`.
+    AfterRow { key: String, id: i64 },
+}
+
+// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
+#[allow(dead_code)]
+impl Pos {
+    fn encode(&self) -> String {
+        let mut frame = Vec::new();
+        match self {
+            Pos::AtKey(key) => {
+                frame.push(0x00);
+                frame.extend_from_slice(key.as_bytes());
+            }
+            Pos::AfterRow { key, id } => {
+                frame.push(0x01);
+                frame.extend_from_slice(&id.to_be_bytes());
+                frame.extend_from_slice(key.as_bytes());
+            }
+        }
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+    }
+
+    fn decode(cursor: &str) -> Result<Self, MetadataError> {
+        let bad = |detail: &str| MetadataError::InvalidCursor {
+            detail: detail.to_string(),
+        };
+        let frame = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .map_err(|_| bad("not valid base64"))?;
+        let (&tag, rest) = frame.split_first().ok_or_else(|| bad("empty cursor"))?;
+        match tag {
+            0x00 => Ok(Pos::AtKey(decode_cursor_key(rest)?)),
+            0x01 => {
+                let id_bytes: [u8; 8] = rest
+                    .get(..8)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| bad("cursor row id is truncated"))?;
+                Ok(Pos::AfterRow {
+                    id: i64::from_be_bytes(id_bytes),
+                    key: decode_cursor_key(&rest[8..])?,
+                })
+            }
+            other => Err(bad(&format!("unknown cursor tag {other:#04x}"))),
+        }
+    }
+}
+
+// Wired up by list_page in a later task; annotated so clippy --all-targets stays clean until then.
+#[allow(dead_code)]
+fn decode_cursor_key(bytes: &[u8]) -> Result<String, MetadataError> {
+    String::from_utf8(bytes.to_vec()).map_err(|_| MetadataError::InvalidCursor {
+        detail: "cursor key is not valid UTF-8".to_string(),
+    })
 }
 
 fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
@@ -729,6 +795,40 @@ mod tests {
         assert_eq!(prefix_successor(""), None);
         assert_eq!(prefix_successor("\u{10FFFF}"), None);
         assert_eq!(prefix_successor("\u{10FFFF}\u{10FFFF}"), None);
+    }
+
+    fn b64(frame: impl AsRef<[u8]>) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
+    }
+
+    #[test]
+    fn cursor_round_trips_an_at_key_position() {
+        // Keys are UTF-8 but may contain control bytes such as NUL.
+        let pos = Pos::AtKey("photos/2024/\u{0}odd".to_string());
+        assert_eq!(Pos::decode(&pos.encode()).unwrap(), pos);
+    }
+
+    #[test]
+    fn cursor_round_trips_an_after_row_position() {
+        let pos = Pos::AfterRow { key: "a/b/c".to_string(), id: 123_456 };
+        assert_eq!(Pos::decode(&pos.encode()).unwrap(), pos);
+    }
+
+    #[test]
+    fn cursor_decode_rejects_bad_input() {
+        for bad in [
+            "!!! not base64 !!!".to_string(),
+            b64([]),                       // empty frame
+            b64([0x09, b'k']),             // unknown tag
+            b64([0x01, 0, 0, 0]),          // tag 0x01, id truncated
+            b64([0x00, 0xFF, 0xFE]),       // tag 0x00, non-UTF-8 key
+        ] {
+            assert!(
+                matches!(Pos::decode(&bad), Err(MetadataError::InvalidCursor { .. })),
+                "expected InvalidCursor for {bad:?}",
+            );
+        }
     }
 
     #[test]
