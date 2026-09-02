@@ -36,6 +36,35 @@ pub struct Metadata {
     pub encryption_context: Option<DataEncryptionContext>,
 }
 
+/// Query parameters for a single page of a list operation.
+pub struct ListParams<'a> {
+    /// Only keys starting with this string are considered.
+    pub prefix: Option<&'a str>,
+    /// When set, keys that contain this string after `prefix` are rolled up
+    /// into a common prefix instead of being returned individually.
+    pub delimiter: Option<&'a str>,
+    /// An opaque token from a previous page's `next_cursor`. `None` starts at
+    /// the beginning of the prefix-bounded range.
+    pub cursor: Option<&'a str>,
+    /// Hard cap on `items.len() + common_prefixes.len()` for the page. Must be
+    /// at least 1; the caller owns S3's default/clamp policy.
+    pub max_keys: usize,
+}
+
+/// One page of a list operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListPage {
+    /// Matching objects, ascending by key (and, for `list_versions`,
+    /// newest-version-first within a key).
+    pub items: Vec<Metadata>,
+    /// Rolled-up prefixes, ascending and deduplicated, each ending with the
+    /// delimiter. Empty when `delimiter` is `None`.
+    pub common_prefixes: Vec<String>,
+    /// `Some` iff the page was truncated; pass it back as the next
+    /// `ListParams::cursor`.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum MetadataError {
     /// The backend itself failed — unreachable database, I/O error, and so on.
@@ -45,6 +74,10 @@ pub enum MetadataError {
     /// cannot be represented in storage. Not retryable — it means a bug or
     /// out-of-band tampering, not a transient fault.
     Corrupt { field: &'static str, detail: String },
+    /// A caller-supplied page cursor could not be decoded. Distinct from
+    /// `Corrupt` (a stored-data or logic fault): this is a client error and
+    /// maps to `InvalidArgument` / 400 once a handler consumes it.
+    InvalidCursor { detail: String },
 }
 
 impl std::fmt::Display for MetadataError {
@@ -53,6 +86,9 @@ impl std::fmt::Display for MetadataError {
             MetadataError::Backend(err) => write!(f, "metadata backend error: {err}"),
             MetadataError::Corrupt { field, detail } => {
                 write!(f, "corrupt metadata field {field}: {detail}")
+            }
+            MetadataError::InvalidCursor { detail } => {
+                write!(f, "invalid page cursor: {detail}")
             }
         }
     }
@@ -140,5 +176,15 @@ mod tests {
         let rendered = format!("{err}");
         assert!(rendered.contains("corrupt metadata field storage_class"), "{rendered}");
         assert!(rendered.contains("unrecognized storage class"), "{rendered}");
+    }
+
+    #[test]
+    fn metadata_error_displays_the_invalid_cursor_detail() {
+        let err = MetadataError::InvalidCursor {
+            detail: "not valid base64".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("invalid page cursor"), "{rendered}");
+        assert!(rendered.contains("not valid base64"), "{rendered}");
     }
 }
