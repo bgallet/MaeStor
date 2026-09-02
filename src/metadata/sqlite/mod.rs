@@ -84,24 +84,7 @@ impl SqliteMetadataStore {
             }
         };
 
-        let mut sql = String::from(
-            "SELECT * FROM object_metadata WHERE bucket = ? AND key >= ?",
-        );
-        if upper.is_some() {
-            sql.push_str(" AND key < ?");
-        }
-        match pos {
-            Some(Pos::AfterRow { .. }) if latest_only => sql.push_str(" AND key > ?"),
-            Some(Pos::AfterRow { .. }) => {
-                sql.push_str(" AND (key > ? OR (key = ? AND id < ?))")
-            }
-            _ => {}
-        }
-        if latest_only {
-            sql.push_str(" AND is_latest = 1 ORDER BY key LIMIT ?");
-        } else {
-            sql.push_str(" ORDER BY key, id DESC LIMIT ?");
-        }
+        let sql = list_batch_sql(upper.is_some(), pos, latest_only);
 
         let mut query = sqlx::query(&sql).bind(bucket).bind(lower);
         if let Some(upper) = upper {
@@ -169,10 +152,16 @@ impl SqliteMetadataStore {
                     });
                 }
 
+                // `list_batch`'s range bounds guarantee `key.starts_with(prefix)`,
+                // so the `&key[prefix.len()..]` slice inside `delimiter_group`
+                // cannot panic on a char boundary or a short key.
                 match params.delimiter.and_then(|d| delimiter_group(&key, prefix, d)) {
                     Some(cp) => {
-                        common_prefixes.push(cp.clone());
-                        match prefix_successor(&cp) {
+                        // Compute the group's successor before moving `cp` into
+                        // the output — no clone needed.
+                        let succ = prefix_successor(&cp);
+                        common_prefixes.push(cp);
+                        match succ {
                             Some(succ) => {
                                 // Skip the rest of this group still in the batch.
                                 while rows.peek().is_some_and(|(k, _, _)| k < &succ) {
@@ -203,6 +192,31 @@ impl SqliteMetadataStore {
             }
         }
     }
+}
+
+/// Builds the `list_batch` query string for a given batch shape, with `?`
+/// placeholders. Kept separate from [`SqliteMetadataStore::list_batch`] so the
+/// query-plan tests can EXPLAIN the exact SQL every branch produces — the
+/// cursor-resume terms included. The bind sequence in `list_batch` must stay in
+/// lockstep with the placeholders here: `bucket`, `lower`, then `upper` (if
+/// `has_upper`), then the resume params (`key` for latest-only `AfterRow`; or
+/// `key`, `key`, `id` otherwise), then `limit`.
+fn list_batch_sql(has_upper: bool, pos: Option<&Pos>, latest_only: bool) -> String {
+    let mut sql = String::from("SELECT * FROM object_metadata WHERE bucket = ? AND key >= ?");
+    if has_upper {
+        sql.push_str(" AND key < ?");
+    }
+    match pos {
+        Some(Pos::AfterRow { .. }) if latest_only => sql.push_str(" AND key > ?"),
+        Some(Pos::AfterRow { .. }) => sql.push_str(" AND (key > ? OR (key = ? AND id < ?))"),
+        _ => {}
+    }
+    if latest_only {
+        sql.push_str(" AND is_latest = 1 ORDER BY key LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY key, id DESC LIMIT ?");
+    }
+    sql
 }
 
 /// Encodes a caller-supplied `SystemTime` as epoch milliseconds. Pre-epoch
@@ -982,37 +996,44 @@ mod tests {
             .join("\n")
     }
 
+    // Every page after the first takes a cursor-resume path, so the plan tests
+    // EXPLAIN the exact SQL `list_batch` builds — placeholders and all — for the
+    // four shapes that reach the database, not a hand-written approximation.
     #[tokio::test]
-    async fn list_batch_query_plan_uses_the_partial_index() {
+    async fn list_batch_query_plans_use_the_right_index_for_every_shape() {
         let store = SqliteMetadataStore::connect_in_memory().await;
-        let plan = query_plan(
-            &store,
-            "SELECT * FROM object_metadata WHERE bucket = 'b' AND key >= 'p/' \
-             AND key < 'p0' AND is_latest = 1 ORDER BY key LIMIT 100",
-        )
-        .await;
-        // SEARCH = a bounded index probe; a full table scan reads "SCAN
-        // object_metadata" with no "USING INDEX".
-        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
-        assert!(
-            plan.contains("USING INDEX idx_object_metadata_one_latest"),
-            "expected the partial index, got:\n{plan}",
-        );
-    }
 
-    #[tokio::test]
-    async fn list_versions_batch_query_plan_uses_an_index() {
-        let store = SqliteMetadataStore::connect_in_memory().await;
-        let plan = query_plan(
-            &store,
-            "SELECT * FROM object_metadata WHERE bucket = 'b' AND key >= 'p/' \
-             AND key < 'p0' ORDER BY key, id DESC LIMIT 100",
-        )
-        .await;
-        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
-        assert!(
-            plan.contains("USING INDEX idx_object_metadata_bucket_key_is_latest"),
-            "expected the bucket/key index, got:\n{plan}",
-        );
+        let after_row = Pos::AfterRow { key: "p/x".to_string(), id: 42 };
+        let at_key = Pos::AtKey("p/x".to_string());
+
+        // (has_upper, pos, latest_only) -> the index the plan must use.
+        let cases: [(bool, &Pos, bool, &str); 4] = [
+            (true, &after_row, true, "idx_object_metadata_one_latest"),
+            (true, &after_row, false, "idx_object_metadata_bucket_key_is_latest"),
+            (false, &at_key, true, "idx_object_metadata_one_latest"),
+            (false, &after_row, false, "idx_object_metadata_bucket_key_is_latest"),
+        ];
+
+        for (has_upper, pos, latest_only, index) in cases {
+            let sql = list_batch_sql(has_upper, Some(pos), latest_only);
+            let plan = query_plan(&store, &sql).await;
+
+            // SEARCH = a bounded index probe; a bare full scan reads
+            // "SCAN object_metadata" on its own line with no "USING INDEX".
+            assert!(
+                plan.contains("SEARCH"),
+                "{sql}\nexpected a bounded index SEARCH, got:\n{plan}",
+            );
+            assert!(
+                plan.contains(&format!("USING INDEX {index}")),
+                "{sql}\nexpected USING INDEX {index}, got:\n{plan}",
+            );
+            for line in plan.lines() {
+                assert!(
+                    !line.contains("SCAN object_metadata") || line.contains("USING INDEX"),
+                    "{sql}\nunexpected bare full scan:\n{plan}",
+                );
+            }
+        }
     }
 }

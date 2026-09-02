@@ -37,17 +37,22 @@ pub struct Metadata {
 }
 
 /// Query parameters for a single page of a list operation.
+#[derive(Debug, Clone, Copy)]
 pub struct ListParams<'a> {
     /// Only keys starting with this string are considered.
     pub prefix: Option<&'a str>,
     /// When set, keys that contain this string after `prefix` are rolled up
-    /// into a common prefix instead of being returned individually.
+    /// into a common prefix instead of being returned individually. An empty
+    /// `delimiter=` (or `prefix=`) query parameter maps to `None`, not
+    /// `Some("")`.
     pub delimiter: Option<&'a str>,
     /// An opaque token from a previous page's `next_cursor`. `None` starts at
     /// the beginning of the prefix-bounded range.
     pub cursor: Option<&'a str>,
     /// Hard cap on `items.len() + common_prefixes.len()` for the page. Must be
-    /// at least 1; the caller owns S3's default/clamp policy.
+    /// at least 1; the caller owns S3's default/clamp policy. A value of `0` is
+    /// coerced to `1`; the handler owns the S3 `max-keys=0` semantics (return
+    /// an empty, untruncated page rather than forwarding the parsed value).
     pub max_keys: usize,
 }
 

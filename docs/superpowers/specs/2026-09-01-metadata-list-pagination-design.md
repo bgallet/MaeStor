@@ -366,6 +366,9 @@ New conformance cases (each run against every backend):
   `next_cursor` to S3's `continuation-token` (opaque, fine as-is) and to
   `ListObjectVersions`' `key-marker` + `version-id-marker` pair, XML rendering
   with `<CommonPrefixes>`.
+- S3 `max-keys=0`: the handler must special-case it (return zero keys,
+  `IsTruncated=false`) rather than forwarding the parsed value to
+  `ListParams::max_keys`, which coerces `0` to `1`.
 - `list_buckets` pagination.
 - `start-after` (S3 `ListObjectsV2`): can be mapped onto `cursor` by the
   handler (encode it the same way) without a trait change.

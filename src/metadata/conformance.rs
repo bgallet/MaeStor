@@ -68,8 +68,11 @@ async fn collect_all(
     let mut items = Vec::new();
     let mut common_prefixes = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut pages = 0;
 
     loop {
+        pages += 1;
+        assert!(pages < 10_000, "collect_all: cursor did not terminate");
         let params = ListParams {
             prefix,
             delimiter,
