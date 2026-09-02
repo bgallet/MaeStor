@@ -514,6 +514,59 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
     assert_eq!(page2.next_cursor, None);
 }
 
+pub(crate) async fn list_rejects_a_malformed_cursor(store: impl MetadataStore) {
+    let err = store
+        .list(
+            "b",
+            ListParams {
+                prefix: None,
+                delimiter: None,
+                cursor: Some("!!!not-base64!!!"),
+                max_keys: 10,
+            },
+        )
+        .await
+        .expect_err("a garbled cursor should be rejected");
+    assert!(
+        matches!(err, MetadataError::InvalidCursor { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+pub(crate) async fn list_versions_paginates_across_keys_and_versions(store: impl MetadataStore) {
+    // k1 gets three versions, k2 gets two.
+    for version in ["v1", "v2", "v3"] {
+        store
+            .put_versioned(sample_metadata("b", "k1", version))
+            .await
+            .expect("put should succeed");
+    }
+    for version in ["v1", "v2"] {
+        store
+            .put_versioned(sample_metadata("b", "k2", version))
+            .await
+            .expect("put should succeed");
+    }
+
+    let (paged, _) = collect_all(&store, "b", true, None, None, 2).await;
+    let (single, _) = collect_all(&store, "b", true, None, None, 1000).await;
+
+    let ids = |rows: &[Metadata]| -> Vec<(String, String)> {
+        rows.iter().map(|m| (m.key.clone(), m.version.0.clone())).collect()
+    };
+    assert_eq!(ids(&paged), ids(&single), "paging must not reorder or drop rows");
+    assert_eq!(
+        ids(&single),
+        vec![
+            ("k1".to_string(), "v3".to_string()),
+            ("k1".to_string(), "v2".to_string()),
+            ("k1".to_string(), "v1".to_string()),
+            ("k2".to_string(), "v2".to_string()),
+            ("k2".to_string(), "v1".to_string()),
+        ],
+    );
+}
+
 pub(crate) async fn list_buckets_returns_distinct_bucket_names(store: impl MetadataStore) {
     store
         .put_versioned(sample_metadata("bucket-b", "k", "v1"))
@@ -763,6 +816,8 @@ macro_rules! metadata_store_conformance {
             case!($make_store, list_groups_keys_under_a_delimiter);
             case!($make_store, list_delimiter_respects_prefix);
             case!($make_store, list_delimiter_page_ends_on_a_common_prefix);
+            case!($make_store, list_rejects_a_malformed_cursor);
+            case!($make_store, list_versions_paginates_across_keys_and_versions);
             case!($make_store, list_buckets_returns_distinct_bucket_names);
             case!(
                 $make_store,
