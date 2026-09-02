@@ -113,6 +113,31 @@ fn decode_content_type(bytes: Vec<u8>) -> Result<ContentType, MetadataError> {
     }
 }
 
+/// The shortest string strictly greater than every string beginning with
+/// `prefix`, in SQLite `TEXT` order (bytewise, which for UTF-8 is codepoint
+/// order). Operates on `char`s, so the result is always valid UTF-8 and can be
+/// bound as a `TEXT` parameter. `None` when there is no such string: `prefix`
+/// is empty or entirely `char::MAX`.
+// Wired up by `list_page` in a later task; annotated so `clippy --all-targets`
+// stays clean until then.
+#[allow(dead_code)]
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if next == 0xD800 {
+            next = 0xE000; // step over the UTF-16 surrogate range
+        }
+        if let Some(next) = char::from_u32(next) {
+            let mut out: String = chars.iter().collect();
+            out.push(next);
+            return Some(out);
+        }
+        // `last` was char::MAX (U+10FFFF): drop it and carry to the previous char.
+    }
+    None
+}
+
 fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
     let storage_class_text: String = row
         .try_get("storage_class")
@@ -679,6 +704,31 @@ mod tests {
             matches!(err, MetadataError::Corrupt { field: "content_type", .. }),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn prefix_successor_increments_the_last_character() {
+        assert_eq!(prefix_successor("abc").as_deref(), Some("abd"));
+        // '/' (0x2F) -> '0' (0x30): the delimiter-group skip case.
+        assert_eq!(prefix_successor("photos/").as_deref(), Some("photos0"));
+    }
+
+    #[test]
+    fn prefix_successor_carries_over_a_char_max_tail() {
+        assert_eq!(prefix_successor("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_successor("a\u{10FFFF}\u{10FFFF}").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn prefix_successor_steps_over_the_surrogate_gap() {
+        assert_eq!(prefix_successor("x\u{D7FF}").as_deref(), Some("x\u{E000}"));
+    }
+
+    #[test]
+    fn prefix_successor_is_none_for_empty_or_all_char_max() {
+        assert_eq!(prefix_successor(""), None);
+        assert_eq!(prefix_successor("\u{10FFFF}"), None);
+        assert_eq!(prefix_successor("\u{10FFFF}\u{10FFFF}"), None);
     }
 
     #[test]
