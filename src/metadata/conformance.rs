@@ -375,6 +375,78 @@ pub(crate) async fn list_versions_returns_every_version_including_markers(
     assert!(versions.iter().any(|m| m.delete_marker));
 }
 
+pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataStore) {
+    for key in ["k1", "k2", "k3", "k4", "k5"] {
+        store
+            .put_versioned(sample_metadata("b", key, "v1"))
+            .await
+            .expect("put should succeed");
+    }
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = store
+            .list(
+                "b",
+                ListParams { prefix: None, delimiter: None, cursor: cursor.as_deref(), max_keys: 2 },
+            )
+            .await
+            .expect("list should succeed");
+        pages += 1;
+        assert!(page.items.len() <= 2, "page over max_keys");
+        seen.extend(page.items.iter().map(|m| m.key.clone()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages < 10, "pagination did not terminate");
+    }
+
+    assert_eq!(pages, 3, "5 keys at page size 2 is three pages");
+    assert_eq!(seen, vec!["k1", "k2", "k3", "k4", "k5"]);
+}
+
+pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl MetadataStore) {
+    for key in ["k1", "k2", "k3", "k4"] {
+        store
+            .put_versioned(sample_metadata("b", key, "v1"))
+            .await
+            .expect("put should succeed");
+    }
+
+    let page1 = store
+        .list("b", ListParams { prefix: None, delimiter: None, cursor: None, max_keys: 2 })
+        .await
+        .expect("list should succeed");
+    let cursor = page1.next_cursor.expect("first page of four is truncated");
+
+    let page2 = store
+        .list(
+            "b",
+            ListParams { prefix: None, delimiter: None, cursor: Some(&cursor), max_keys: 2 },
+        )
+        .await
+        .expect("list should succeed");
+    let keys: Vec<_> = page2.items.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(keys, vec!["k3", "k4"]);
+    assert_eq!(page2.next_cursor, None, "the exact final page is not truncated");
+}
+
+pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl MetadataStore) {
+    let page = store
+        .list(
+            "no-such-bucket",
+            ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 100 },
+        )
+        .await
+        .expect("list should succeed");
+    assert_eq!(page.items, Vec::new());
+    assert_eq!(page.common_prefixes, Vec::<String>::new());
+    assert_eq!(page.next_cursor, None);
+}
+
 pub(crate) async fn list_buckets_returns_distinct_bucket_names(store: impl MetadataStore) {
     store
         .put_versioned(sample_metadata("bucket-b", "k", "v1"))
@@ -618,6 +690,9 @@ macro_rules! metadata_store_conformance {
                 $make_store,
                 list_versions_returns_every_version_including_markers
             );
+            case!($make_store, list_paginates_and_reports_truncation);
+            case!($make_store, list_final_exact_page_has_no_next_cursor);
+            case!($make_store, list_of_an_empty_bucket_is_an_empty_page);
             case!($make_store, list_buckets_returns_distinct_bucket_names);
             case!(
                 $make_store,
