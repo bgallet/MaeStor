@@ -156,14 +156,55 @@ pub trait MetadataStore: Send + Sync {
         bucket: &str,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
+    /// Every bucket owned by `owner` — full [`Bucket`] rows, ascending by
+    /// `name`. Not paginated (bucket counts per owner are small, and S3's
+    /// `ListBuckets` is per-caller anyway).
     async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError>;
+    /// Creates a bucket owned by `owner`, with `created_at == modified_at ==`
+    /// now, `versioning = Unversioned`, and no acl/cors/lifecycle. Returns the
+    /// stored row. `Err(MetadataError::BucketAlreadyExists)` if `name` is
+    /// already taken — bucket names are global, not owner-scoped.
     async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError>;
+    /// The stored [`Bucket`], or `None` if no bucket has that name. Not
+    /// owner-scoped — S3's bucket namespace is global.
     async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError>;
+    /// Removes the bucket row. Idempotent — `Ok(())` whether or not it existed.
+    /// Does **not** touch the bucket's objects; the empty-bucket precondition
+    /// for S3 `DeleteBucket` is the handler's to enforce.
     async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
-    async fn set_bucket_versioning(&self, name: &str, state: BucketVersioning) -> Result<(), MetadataError>;
-    async fn set_bucket_acl(&self, name: &str, acl: Option<Bytes>) -> Result<(), MetadataError>;
-    async fn set_bucket_cors(&self, name: &str, cors: Option<Bytes>) -> Result<(), MetadataError>;
-    async fn set_bucket_lifecycle(&self, name: &str, lifecycle: Option<Bytes>) -> Result<(), MetadataError>;
+    /// Sets the bucket's versioning state and bumps `modified_at` to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist. Does
+    /// not police the `Enabled`/`Suspended`-only transition — it writes
+    /// whatever state it is given; the S3 state machine is a handler concern.
+    async fn set_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioning,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw ACL document, `None` clears it
+    /// (S3 `DeleteBucketAcl`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_acl(
+        &self,
+        name: &str,
+        acl: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw CORS document, `None` clears it
+    /// (S3 `DeleteBucketCors`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_cors(
+        &self,
+        name: &str,
+        cors: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw lifecycle document, `None` clears
+    /// it (S3 `DeleteBucketLifecycle`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
 }
 
 #[cfg(test)]

@@ -570,9 +570,11 @@ pub(crate) async fn list_versions_paginates_across_keys_and_versions(store: impl
     );
 }
 
+const BUCKET_OWNER: &str = "owner-1";
+
 pub(crate) async fn list_buckets_is_scoped_to_owner_and_sorted(store: impl MetadataStore) {
-    store.create_bucket("b", "owner-1").await.expect("create b");
-    store.create_bucket("a", "owner-1").await.expect("create a");
+    store.create_bucket("b", BUCKET_OWNER).await.expect("create b");
+    store.create_bucket("a", BUCKET_OWNER).await.expect("create a");
     store.create_bucket("m", "owner-2").await.expect("create m");
 
     let owned = store.list_buckets("owner-1").await.expect("list_buckets should succeed");
@@ -586,8 +588,6 @@ pub(crate) async fn list_buckets_is_scoped_to_owner_and_sorted(store: impl Metad
     let none = store.list_buckets("owner-3").await.expect("list_buckets should succeed");
     assert!(none.is_empty());
 }
-
-const BUCKET_OWNER: &str = "owner-1";
 
 pub(crate) async fn create_bucket_then_get_returns_the_row(store: impl MetadataStore) {
     let created = store
@@ -698,6 +698,11 @@ pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl Metad
     store.set_bucket_acl("b", None).await.expect("clear acl");
     store.set_bucket_cors("b", None).await.expect("clear cors");
     store.set_bucket_lifecycle("b", None).await.expect("clear lifecycle");
+
+    store
+        .set_bucket_cors("b", None)
+        .await
+        .expect("clearing an already-unset config should still succeed");
 
     let without = store.get_bucket("b").await.expect("get").expect("exists");
     assert_eq!(without.acl, None);

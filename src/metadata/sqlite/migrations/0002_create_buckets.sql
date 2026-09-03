@@ -1,5 +1,5 @@
 CREATE TABLE buckets (
-    name        TEXT PRIMARY KEY,
+    name        TEXT PRIMARY KEY NOT NULL,
     owner       TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     modified_at INTEGER NOT NULL,

@@ -1276,4 +1276,42 @@ mod tests {
         assert_eq!(created.created_at, fetched.created_at);
         assert_eq!(created.modified_at, fetched.modified_at);
     }
+
+    // Pins the `modified_at = ?` bump in every setter's `UPDATE`: a bucket
+    // planted with `modified_at = 0` must read back with a fresh (post-epoch)
+    // `modified_at` after each setter runs. `set_bucket_cors` also covers the
+    // shared `set_bucket_blob` path.
+    #[tokio::test]
+    async fn set_bucket_setters_bump_modified_at() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES ('b', 'o', 0, 0, 'UNVERSIONED')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        store
+            .set_bucket_versioning("b", BucketVersioning::Enabled)
+            .await
+            .expect("set_bucket_versioning should succeed");
+        let after_versioning = store.get_bucket("b").await.expect("get").expect("exists");
+        assert!(
+            after_versioning.modified_at > millis_to_system_time(0),
+            "set_bucket_versioning did not bump modified_at: {:?}",
+            after_versioning.modified_at,
+        );
+
+        store
+            .set_bucket_cors("b", Some(Bytes::from_static(b"<c/>")))
+            .await
+            .expect("set_bucket_cors should succeed");
+        let after_cors = store.get_bucket("b").await.expect("get").expect("exists");
+        assert!(
+            after_cors.modified_at > millis_to_system_time(0),
+            "set_bucket_cors did not bump modified_at: {:?}",
+            after_cors.modified_at,
+        );
+    }
 }
