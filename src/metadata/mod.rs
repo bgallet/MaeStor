@@ -157,6 +157,9 @@ pub trait MetadataStore: Send + Sync {
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
     async fn list_buckets(&self) -> Result<Vec<String>, MetadataError>;
+    async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError>;
+    async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError>;
+    async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
 }
 
 #[cfg(test)]

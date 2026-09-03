@@ -8,8 +8,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ListPage, ListParams,
-    Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
+    Bucket, BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag,
+    KnownContentType, ListPage, ListParams, Metadata, MetadataError, MetadataStore,
+    ObjectStorageClass, ObjectVersion,
 };
 
 pub struct SqliteMetadataStore {
@@ -455,6 +456,37 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
     })
 }
 
+fn row_to_bucket(row: &SqliteRow) -> Result<Bucket, MetadataError> {
+    let versioning_text: String = row.try_get("versioning").map_err(MetadataError::Backend)?;
+    let versioning =
+        BucketVersioning::parse(&versioning_text).ok_or_else(|| MetadataError::Corrupt {
+            field: "versioning",
+            detail: format!("unrecognized bucket versioning state {versioning_text:?}"),
+        })?;
+
+    let blob = |name: &str| -> Result<Option<Bytes>, MetadataError> {
+        Ok(row
+            .try_get::<Option<Vec<u8>>, _>(name)
+            .map_err(MetadataError::Backend)?
+            .map(Bytes::from))
+    };
+
+    Ok(Bucket {
+        name: row.try_get("name").map_err(MetadataError::Backend)?,
+        owner: row.try_get("owner").map_err(MetadataError::Backend)?,
+        created_at: millis_to_system_time(
+            row.try_get("created_at").map_err(MetadataError::Backend)?,
+        ),
+        modified_at: millis_to_system_time(
+            row.try_get("modified_at").map_err(MetadataError::Backend)?,
+        ),
+        versioning,
+        acl: blob("acl")?,
+        cors: blob("cors")?,
+        lifecycle: blob("lifecycle")?,
+    })
+}
+
 async fn upsert_row<'e, E>(executor: E, metadata: &Metadata) -> Result<(), MetadataError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -709,6 +741,58 @@ impl MetadataStore for SqliteMetadataStore {
                 .map_err(MetadataError::Backend)?;
 
         Ok(rows.into_iter().map(|(bucket,)| bucket).collect())
+    }
+
+    async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError> {
+        let now_millis = system_time_to_millis(SystemTime::now(), "created_at")?;
+        let versioning = BucketVersioning::default();
+
+        let result = sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(owner)
+        .bind(now_millis)
+        .bind(now_millis)
+        .bind(versioning.as_str())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(Bucket {
+                name: name.to_string(),
+                owner: owner.to_string(),
+                created_at: millis_to_system_time(now_millis),
+                modified_at: millis_to_system_time(now_millis),
+                versioning,
+                acl: None,
+                cors: None,
+                lifecycle: None,
+            }),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(MetadataError::BucketAlreadyExists { name: name.to_string() })
+            }
+            Err(err) => Err(MetadataError::Backend(err)),
+        }
+    }
+
+    async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError> {
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        row.map(|row| row_to_bucket(&row)).transpose()
+    }
+
+    async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        sqlx::query("DELETE FROM buckets WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        Ok(())
     }
 }
 
