@@ -29,8 +29,8 @@ use crate::metadata::{
 };
 
 /// A metadata record with every optional field left empty, for tests that only
-/// care about a couple of fields. `is_latest` starts `false`; the `put_*`
-/// methods set it themselves.
+/// care about a couple of fields. `is_latest` starts `false`; `put` sets it
+/// itself.
 pub(crate) fn sample_metadata(key: &str, version: &str) -> Metadata {
     Metadata {
         etag: Etag(Bytes::from_static(b"\"etag\"")),
@@ -128,7 +128,7 @@ async fn versions_for_key(store: &impl MetadataStore, bucket: &Bucket, key: &str
     versions
 }
 
-pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
+pub(crate) async fn put_on_an_enabled_bucket_inserts_a_new_latest_and_demotes_the_old_one(
     store: impl MetadataStore,
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
@@ -159,7 +159,7 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
     assert!(!previous.is_latest);
 }
 
-pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataStore) {
+pub(crate) async fn put_on_an_unversioned_bucket_upserts_a_single_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let mut first = sample_metadata("k", "ignored");
     first.size = 10;
@@ -246,7 +246,7 @@ pub(crate) async fn get_returns_none_for_a_key_that_was_never_written(store: imp
     assert_eq!(found, None);
 }
 
-pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: impl MetadataStore) {
+pub(crate) async fn delete_on_an_enabled_bucket_creates_a_marker_as_the_new_latest(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
         .put(&bucket, sample_metadata("k", "v1"))
@@ -275,7 +275,7 @@ pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: i
     assert!(!original.delete_marker);
 }
 
-pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl MetadataStore) {
+pub(crate) async fn delete_version_removes_only_that_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
         .put(&bucket, sample_metadata("k", "v1"))
@@ -300,7 +300,7 @@ pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl Me
     assert_eq!(latest.version, ObjectVersion("v2".to_string()));
 }
 
-pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_latest_is_removed(
+pub(crate) async fn delete_version_promotes_the_next_latest_when_the_latest_is_removed(
     store: impl MetadataStore,
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
@@ -327,7 +327,7 @@ pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_la
     assert!(latest.is_latest);
 }
 
-pub(crate) async fn delete_unversioned_removes_the_sentinel_row(store: impl MetadataStore) {
+pub(crate) async fn delete_on_an_unversioned_bucket_removes_the_sentinel_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
         .put(&bucket, sample_metadata("k", "ignored"))
@@ -495,7 +495,7 @@ pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl Metadat
 }
 
 pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl MetadataStore) {
-    let bucket = fresh_bucket(&store, "no-such-bucket", BucketVersioning::Unversioned).await;
+    let bucket = fresh_bucket(&store, "empty", BucketVersioning::Unversioned).await;
     let page = store
         .list(
             &bucket,
@@ -774,6 +774,11 @@ pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl Metad
 }
 
 pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl MetadataStore) {
+    // The ghost `Bucket` literal is `OBJECT_OWNER`; the real bucket below is
+    // created under `BUCKET_OWNER`, and the final assertion lists by
+    // `BUCKET_OWNER`. Keep the two owner constants distinct — collapsing them
+    // would let the ghost's owner match the queried owner and blur what this
+    // case isolates (that `list_buckets` never reads `object_metadata`).
     // An object whose bucket has no `buckets` row.
     let ghost = Bucket {
         name: "ghost-bucket".to_string(),
@@ -796,7 +801,7 @@ pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl Metadat
     assert_eq!(names, vec!["real"]);
 }
 
-pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
+pub(crate) async fn put_on_a_suspended_bucket_demotes_existing_versioned_latest_rows(
     store: impl MetadataStore,
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
@@ -835,7 +840,7 @@ pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
     assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 3);
 }
 
-pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
+pub(crate) async fn repeated_put_on_an_unversioned_bucket_keeps_the_sentinel_row_latest(
     store: impl MetadataStore,
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
@@ -1028,6 +1033,34 @@ pub(crate) async fn delete_on_a_suspended_bucket_marks_null(store: impl Metadata
     assert_eq!(latest.version, ObjectVersion::unversioned());
 }
 
+pub(crate) async fn delete_on_a_suspended_bucket_demotes_other_latest_rows_and_keeps_history(
+    store: impl MetadataStore,
+) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
+    store.put(&bucket, sample_metadata("k", "v1")).await.expect("put v1");
+    store.put(&bucket, sample_metadata("k", "v2")).await.expect("put v2");
+
+    store.set_bucket_versioning("b", BucketVersioning::Suspended).await.expect("suspend");
+    let bucket = store.get_bucket("b").await.expect("get_bucket").expect("exists");
+
+    let marker = store
+        .delete(&bucket, "k")
+        .await
+        .expect("delete should succeed")
+        .expect("a suspended bucket's delete returns a marker");
+    assert_eq!(marker, ObjectVersion::unversioned());
+
+    let latest = store.get(&bucket, "k", None).await.expect("get").expect("row");
+    assert!(latest.delete_marker);
+    assert_eq!(latest.version, ObjectVersion::unversioned());
+
+    // v1 and v2 are demoted, not removed — the null marker joins them.
+    let history = versions_for_key(&store, &bucket, "k").await;
+    let ids: Vec<_> = history.iter().map(|m| m.version.0.as_str()).collect();
+    assert_eq!(history.len(), 3, "{ids:?}");
+    assert!(ids.contains(&"v1") && ids.contains(&"v2") && ids.contains(&"null"), "{ids:?}");
+}
+
 pub(crate) async fn delete_on_an_unversioned_bucket_hard_removes_and_returns_none(
     store: impl MetadataStore,
 ) {
@@ -1065,9 +1098,9 @@ macro_rules! metadata_store_conformance {
 
             case!(
                 $make_store,
-                put_versioned_inserts_a_new_latest_and_demotes_the_old_one
+                put_on_an_enabled_bucket_inserts_a_new_latest_and_demotes_the_old_one
             );
-            case!($make_store, put_unversioned_upserts_a_single_row);
+            case!($make_store, put_on_an_unversioned_bucket_upserts_a_single_row);
             case!($make_store, get_with_no_version_returns_the_latest_row);
             case!(
                 $make_store,
@@ -1079,14 +1112,14 @@ macro_rules! metadata_store_conformance {
             );
             case!(
                 $make_store,
-                delete_versioned_creates_a_marker_as_the_new_latest
+                delete_on_an_enabled_bucket_creates_a_marker_as_the_new_latest
             );
-            case!($make_store, delete_specific_version_removes_only_that_row);
+            case!($make_store, delete_version_removes_only_that_row);
             case!(
                 $make_store,
-                delete_specific_version_promotes_the_next_latest_when_the_latest_is_removed
+                delete_version_promotes_the_next_latest_when_the_latest_is_removed
             );
-            case!($make_store, delete_unversioned_removes_the_sentinel_row);
+            case!($make_store, delete_on_an_unversioned_bucket_removes_the_sentinel_row);
             case!($make_store, list_returns_latest_rows_for_a_bucket);
             case!($make_store, list_filters_by_prefix);
             case!(
@@ -1117,11 +1150,11 @@ macro_rules! metadata_store_conformance {
             case!($make_store, list_buckets_reads_only_the_bucket_table);
             case!(
                 $make_store,
-                put_unversioned_demotes_existing_versioned_latest_rows
+                put_on_a_suspended_bucket_demotes_existing_versioned_latest_rows
             );
             case!(
                 $make_store,
-                repeated_put_unversioned_keeps_the_sentinel_row_latest
+                repeated_put_on_an_unversioned_bucket_keeps_the_sentinel_row_latest
             );
             case!($make_store, put_rejects_a_pre_epoch_last_modified);
             case!($make_store, put_rejects_a_pre_epoch_cloned_at);
@@ -1130,6 +1163,10 @@ macro_rules! metadata_store_conformance {
             case!($make_store, put_on_a_suspended_bucket_overwrites_null_and_keeps_versioned_history);
             case!($make_store, delete_on_an_enabled_bucket_returns_a_generated_marker_id);
             case!($make_store, delete_on_a_suspended_bucket_marks_null);
+            case!(
+                $make_store,
+                delete_on_a_suspended_bucket_demotes_other_latest_rows_and_keeps_history
+            );
             case!($make_store, delete_on_an_unversioned_bucket_hard_removes_and_returns_none);
             case!($make_store, metadata_store_is_object_safe);
         }

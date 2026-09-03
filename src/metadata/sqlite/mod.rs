@@ -259,11 +259,11 @@ impl SqliteMetadataStore {
         tx.commit().await.map_err(MetadataError::Backend)
     }
 
-    /// Writes a delete marker for `(bucket, key)` at `version` as the new latest
-    /// row, demoting whatever row currently holds that flag.
+    /// Writes a delete marker for `(bucket_name, key)` at `version` as the new
+    /// latest row, demoting whatever row currently holds that flag.
     async fn insert_delete_marker(
         &self,
-        bucket: &Bucket,
+        bucket_name: &str,
         key: &str,
         version: ObjectVersion,
     ) -> Result<(), MetadataError> {
@@ -287,7 +287,7 @@ impl SqliteMetadataStore {
             encryption_context: None,
         };
 
-        self.insert_row_as_latest(&bucket.name, &marker, false).await
+        self.insert_row_as_latest(bucket_name, &marker, false).await
     }
 }
 
@@ -335,6 +335,13 @@ fn millis_to_system_time(millis: i64) -> SystemTime {
 /// A fresh, time-sortable object version id (UUIDv7). Used for
 /// store-generated delete-marker ids; the 48-bit millisecond prefix makes
 /// successive ids sort in creation order by the `version` column alone.
+///
+/// That ordering guarantee is per-process only: `uuid::Uuid::now_v7()` orders
+/// ids minted within one process, but two markers created in the same
+/// millisecond by different processes have no defined relative order, and the
+/// prefix only orders at millisecond granularity in any case. `list_versions`
+/// does not depend on it — it currently orders rows (markers included) by rowid
+/// (`id`), not by the `version` column.
 fn new_version_id() -> ObjectVersion {
     ObjectVersion(uuid::Uuid::now_v7().to_string())
 }
@@ -721,12 +728,12 @@ impl MetadataStore for SqliteMetadataStore {
         match bucket.versioning {
             BucketVersioning::Enabled => {
                 let marker = new_version_id();
-                self.insert_delete_marker(bucket, key, marker.clone()).await?;
+                self.insert_delete_marker(&bucket.name, key, marker.clone()).await?;
                 Ok(Some(marker))
             }
             BucketVersioning::Suspended => {
                 let null = ObjectVersion::unversioned();
-                self.insert_delete_marker(bucket, key, null.clone()).await?;
+                self.insert_delete_marker(&bucket.name, key, null.clone()).await?;
                 Ok(Some(null))
             }
             BucketVersioning::Unversioned => {

@@ -196,8 +196,12 @@ server mints all version ids and returns the marker's in `x-amz-version-id`.
 (`uuid = { version = "1", features = ["v7"] }`, a new direct dependency):
 `ObjectVersion(uuid::Uuid::now_v7().to_string())`. The string form is
 lexicographically ordered by creation time (48-bit ms timestamp prefix), so
-successive markers for a key sort in creation order by the `version` column
-alone. It is generated in Rust, so the marker row's `INSERT` binds it like
+successive markers minted **within one process** sort in creation order by the
+`version` column alone. That ordering is per-process only — two markers created
+in the same millisecond by different processes have no defined relative order,
+and the prefix orders at millisecond granularity in any case — so
+`list_versions` keeps ordering by rowid, not by `version`. It is generated in
+Rust, so the marker row's `INSERT` binds it like
 any other value — no `RETURNING`, and `delete` returns the id it just
 generated. This is a free function `fn new_version_id() -> ObjectVersion` in
 `sqlite/mod.rs` (or promoted to `metadata` if a second backend wants it).
