@@ -84,7 +84,7 @@ async fn fresh_bucket(
 /// `page_size >= 1`.
 async fn collect_all(
     store: &impl MetadataStore,
-    bucket: &str,
+    bucket: &Bucket,
     versions: bool,
     prefix: Option<&str>,
     delimiter: Option<&str>,
@@ -106,9 +106,9 @@ async fn collect_all(
             max_keys: page_size,
         };
         let page: ListPage = if versions {
-            store.list_versions(bucket, params).await
+            store.list_versions(&bucket.name, params).await
         } else {
-            store.list(bucket, params).await
+            store.list(&bucket.name, params).await
         }
         .expect("list should succeed");
 
@@ -123,7 +123,7 @@ async fn collect_all(
 }
 
 /// Every stored version for one key, newest-first, via the public API.
-async fn versions_for_key(store: &impl MetadataStore, bucket: &str, key: &str) -> Vec<Metadata> {
+async fn versions_for_key(store: &impl MetadataStore, bucket: &Bucket, key: &str) -> Vec<Metadata> {
     let (mut versions, _) = collect_all(store, bucket, true, None, None, 1000).await;
     versions.retain(|m| m.key == key);
     versions
@@ -142,7 +142,7 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
         .await
         .expect("second put should succeed");
 
-    assert_eq!(versions_for_key(&store, "b", "k").await.len(), 2);
+    assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 2);
 
     let latest = store
         .get(&bucket.name, "k", None)
@@ -176,7 +176,7 @@ pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataSto
         .await
         .expect("second put should succeed");
 
-    assert_eq!(versions_for_key(&store, "b", "k").await.len(), 1);
+    assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 1);
 
     let latest = store
         .get(&bucket.name, "k", None)
@@ -292,7 +292,7 @@ pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl Me
         .await
         .expect("delete should succeed");
 
-    assert_eq!(versions_for_key(&store, "b", "k").await.len(), 1);
+    assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 1);
     let latest = store
         .get(&bucket.name, "k", None)
         .await
@@ -349,44 +349,47 @@ pub(crate) async fn delete_unversioned_removes_the_sentinel_row(store: impl Meta
 }
 
 pub(crate) async fn list_returns_latest_rows_for_a_bucket(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
+    let other = fresh_bucket(&store, "other-bucket", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "a", "v1"))
+        .put(&bucket, sample_metadata("b", "a", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "a", "v2"))
+        .put(&bucket, sample_metadata("b", "a", "v2"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "c", "v1"))
+        .put(&bucket, sample_metadata("b", "c", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("other-bucket", "a", "v1"))
+        .put(&other, sample_metadata("other-bucket", "a", "v1"))
         .await
         .expect("put should succeed");
 
-    let (listed, _) = collect_all(&store, "b", false, None, None, 2).await;
+    let (listed, _) = collect_all(&store, &bucket, false, None, None, 2).await;
     assert_eq!(listed.len(), 2);
     let versions: Vec<_> = listed.iter().map(|m| m.version.0.as_str()).collect();
     assert_eq!(versions, vec!["v2", "v1"]);
 }
 
 pub(crate) async fn list_filters_by_prefix(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put_versioned(sample_metadata("b", "docs/a", "v1"))
+        .put(&bucket, sample_metadata("b", "docs/a", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "docs/b", "v1"))
+        .put(&bucket, sample_metadata("b", "docs/b", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "images/c", "v1"))
+        .put(&bucket, sample_metadata("b", "images/c", "v1"))
         .await
         .expect("put should succeed");
 
-    let (listed, _) = collect_all(&store, "b", false, Some("docs/"), None, 1000).await;
+    let (listed, _) = collect_all(&store, &bucket, false, Some("docs/"), None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["docs/a", "docs/b"]);
 }
@@ -394,16 +397,17 @@ pub(crate) async fn list_filters_by_prefix(store: impl MetadataStore) {
 pub(crate) async fn list_prefix_does_not_treat_percent_or_underscore_as_wildcards(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put_versioned(sample_metadata("b", "100%_off", "v1"))
+        .put(&bucket, sample_metadata("b", "100%_off", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "100X_off", "v1"))
+        .put(&bucket, sample_metadata("b", "100X_off", "v1"))
         .await
         .expect("put should succeed");
 
-    let (listed, _) = collect_all(&store, "b", false, Some("100%"), None, 1000).await;
+    let (listed, _) = collect_all(&store, &bucket, false, Some("100%"), None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["100%_off"]);
 }
@@ -411,26 +415,30 @@ pub(crate) async fn list_prefix_does_not_treat_percent_or_underscore_as_wildcard
 pub(crate) async fn list_versions_returns_every_version_including_markers(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
-    store
-        .delete_versioned("b", "k", ObjectVersion("marker1".to_string()))
+    let marker = store
+        .delete(&bucket, "k")
         .await
-        .expect("delete should succeed");
+        .expect("delete should succeed")
+        .expect("an enabled bucket returns a marker");
 
-    let (versions, _) = collect_all(&store, "b", true, None, None, 1000).await;
-    let version_ids: Vec<_> = versions.iter().map(|m| m.version.0.as_str()).collect();
+    let (versions, _) = collect_all(&store, &bucket, true, None, None, 1000).await;
+    assert_eq!(versions.len(), 2);
     // Newest-first within a key, matching S3's ListObjectVersions.
-    assert_eq!(version_ids, vec!["marker1", "v1"]);
-    assert!(versions.iter().any(|m| m.delete_marker));
+    assert_eq!(versions[0].version, marker);
+    assert!(versions[0].delete_marker);
+    assert_eq!(versions[1].version.0.as_str(), "v1");
 }
 
 pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["k1", "k2", "k3", "k4", "k5"] {
         store
-            .put_versioned(sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata("b", key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -441,7 +449,7 @@ pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataSt
     loop {
         let page = store
             .list(
-                "b",
+                &bucket.name,
                 ListParams { prefix: None, delimiter: None, cursor: cursor.as_deref(), max_keys: 2 },
             )
             .await
@@ -461,22 +469,23 @@ pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataSt
 }
 
 pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["k1", "k2", "k3", "k4"] {
         store
-            .put_versioned(sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata("b", key, "v1"))
             .await
             .expect("put should succeed");
     }
 
     let page1 = store
-        .list("b", ListParams { prefix: None, delimiter: None, cursor: None, max_keys: 2 })
+        .list(&bucket.name, ListParams { prefix: None, delimiter: None, cursor: None, max_keys: 2 })
         .await
         .expect("list should succeed");
     let cursor = page1.next_cursor.expect("first page of four is truncated");
 
     let page2 = store
         .list(
-            "b",
+            &bucket.name,
             ListParams { prefix: None, delimiter: None, cursor: Some(&cursor), max_keys: 2 },
         )
         .await
@@ -487,9 +496,10 @@ pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl Metadat
 }
 
 pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "no-such-bucket", BucketVersioning::Unversioned).await;
     let page = store
         .list(
-            "no-such-bucket",
+            &bucket.name,
             ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 100 },
         )
         .await
@@ -500,46 +510,49 @@ pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl Metadat
 }
 
 pub(crate) async fn list_groups_keys_under_a_delimiter(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["a", "p/1", "p/2", "q/1", "z"] {
         store
-            .put_versioned(sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata("b", key, "v1"))
             .await
             .expect("put should succeed");
     }
 
     let (items, common_prefixes) =
-        collect_all(&store, "b", false, None, Some("/"), 1000).await;
+        collect_all(&store, &bucket, false, None, Some("/"), 1000).await;
     let keys: Vec<_> = items.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["a", "z"]);
     assert_eq!(common_prefixes, vec!["p/".to_string(), "q/".to_string()]);
 }
 
 pub(crate) async fn list_delimiter_respects_prefix(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["p/x", "p/sub/a", "p/sub/b"] {
         store
-            .put_versioned(sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata("b", key, "v1"))
             .await
             .expect("put should succeed");
     }
 
     let (items, common_prefixes) =
-        collect_all(&store, "b", false, Some("p/"), Some("/"), 1000).await;
+        collect_all(&store, &bucket, false, Some("p/"), Some("/"), 1000).await;
     let keys: Vec<_> = items.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["p/x"]);
     assert_eq!(common_prefixes, vec!["p/sub/".to_string()]);
 }
 
 pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["g/1", "g/2", "g/3", "g/4", "z"] {
         store
-            .put_versioned(sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata("b", key, "v1"))
             .await
             .expect("put should succeed");
     }
 
     let page1 = store
         .list(
-            "b",
+            &bucket.name,
             ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 1 },
         )
         .await
@@ -550,7 +563,7 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
 
     let page2 = store
         .list(
-            "b",
+            &bucket.name,
             ListParams {
                 prefix: None,
                 delimiter: Some("/"),
@@ -567,9 +580,10 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
 }
 
 pub(crate) async fn list_rejects_a_malformed_cursor(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let err = store
         .list(
-            "b",
+            &bucket.name,
             ListParams {
                 prefix: None,
                 delimiter: None,
@@ -586,22 +600,23 @@ pub(crate) async fn list_rejects_a_malformed_cursor(store: impl MetadataStore) {
 }
 
 pub(crate) async fn list_versions_paginates_across_keys_and_versions(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     // k1 gets three versions, k2 gets two.
     for version in ["v1", "v2", "v3"] {
         store
-            .put_versioned(sample_metadata("b", "k1", version))
+            .put(&bucket, sample_metadata("b", "k1", version))
             .await
             .expect("put should succeed");
     }
     for version in ["v1", "v2"] {
         store
-            .put_versioned(sample_metadata("b", "k2", version))
+            .put(&bucket, sample_metadata("b", "k2", version))
             .await
             .expect("put should succeed");
     }
 
-    let (paged, _) = collect_all(&store, "b", true, None, None, 2).await;
-    let (single, _) = collect_all(&store, "b", true, None, None, 1000).await;
+    let (paged, _) = collect_all(&store, &bucket, true, None, None, 2).await;
+    let (single, _) = collect_all(&store, &bucket, true, None, None, 1000).await;
 
     let ids = |rows: &[Metadata]| -> Vec<(String, String)> {
         rows.iter().map(|m| (m.key.clone(), m.version.0.clone())).collect()
@@ -785,49 +800,57 @@ pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl Metadat
 pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("put should succeed");
 
     store
-        .put_unversioned(sample_metadata("b", "k", "ignored"))
+        .set_bucket_versioning("b", BucketVersioning::Suspended)
         .await
-        .expect("put_unversioned should succeed");
+        .expect("suspend");
+    let bucket = store.get_bucket("b").await.expect("get").expect("exists");
+
+    store
+        .put(&bucket, sample_metadata("b", "k", "ignored"))
+        .await
+        .expect("put should succeed");
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a latest row should be found");
     assert_eq!(latest.version, ObjectVersion::unversioned());
 
-    let (listed, _) = collect_all(&store, "b", false, None, None, 1000).await;
+    let (listed, _) = collect_all(&store, &bucket, false, None, None, 1000).await;
     let keys: Vec<_> = listed.iter().map(|m| m.key.as_str()).collect();
     assert_eq!(keys, vec!["k"]);
 
     // All three versions still exist; only the latest flag moved.
-    assert_eq!(versions_for_key(&store, "b", "k").await.len(), 3);
+    assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 3);
 }
 
 pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put_unversioned(sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("b", "k", "ignored"))
         .await
         .expect("first put should succeed");
     store
-        .put_unversioned(sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("b", "k", "ignored"))
         .await
         .expect("second put should succeed");
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("the sentinel row should still be latest");
