@@ -903,6 +903,7 @@ impl MetadataStore for SqliteMetadataStore {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::metadata::conformance::sample_metadata;
 
     // The behavioral contract is exercised once, through the trait, by the
     // shared conformance suite. Only tests that need SQLite internals — the
@@ -1374,5 +1375,21 @@ mod tests {
             "set_bucket_cors did not bump modified_at: {:?}",
             after_cors.modified_at,
         );
+    }
+
+    #[tokio::test]
+    async fn successive_delete_markers_get_ascending_version_ids() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store.create_bucket("b", "o").await.expect("create");
+        store.set_bucket_versioning("b", BucketVersioning::Enabled).await.expect("enable");
+        let bucket = store.get_bucket("b").await.expect("get").expect("exists");
+
+        store.put(&bucket, sample_metadata("k", "v1")).await.expect("put");
+        let m1 = store.delete(&bucket, "k").await.expect("d1").expect("marker");
+        store.put(&bucket, sample_metadata("k", "v2")).await.expect("put");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let m2 = store.delete(&bucket, "k").await.expect("d2").expect("marker");
+
+        assert!(m1.0 < m2.0, "{} should sort before {}", m1.0, m2.0);
     }
 }

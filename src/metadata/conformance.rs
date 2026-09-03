@@ -968,6 +968,77 @@ pub(crate) async fn metadata_store_is_object_safe(store: impl MetadataStore + 's
         .expect("list_buckets should succeed");
 }
 
+pub(crate) async fn put_on_a_suspended_bucket_overwrites_null_and_keeps_versioned_history(
+    store: impl MetadataStore,
+) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
+    store.put(&bucket, sample_metadata("k", "v1")).await.expect("put v1");
+    store.put(&bucket, sample_metadata("k", "v2")).await.expect("put v2");
+
+    store.set_bucket_versioning("b", BucketVersioning::Suspended).await.expect("suspend");
+    let bucket = store.get_bucket("b").await.expect("get_bucket").expect("exists");
+
+    let mut null_put = sample_metadata("k", "ignored");
+    null_put.size = 999;
+    store.put(&bucket, null_put).await.expect("put into suspended bucket");
+
+    let latest = store.get(&bucket, "k", None).await.expect("get").expect("row");
+    assert_eq!(latest.version, ObjectVersion::unversioned());
+    assert_eq!(latest.size, 999);
+
+    let (versions, _) = collect_all(&store, &bucket, true, None, None, 1000).await;
+    let ids: Vec<_> = versions.iter().map(|m| m.version.0.as_str()).collect();
+    assert!(
+        ids.contains(&"v1") && ids.contains(&"v2") && ids.contains(&"null"),
+        "{ids:?}"
+    );
+}
+
+pub(crate) async fn delete_on_an_enabled_bucket_returns_a_generated_marker_id(
+    store: impl MetadataStore,
+) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
+    store.put(&bucket, sample_metadata("k", "v1")).await.expect("put");
+
+    let marker = store
+        .delete(&bucket, "k")
+        .await
+        .expect("delete should succeed")
+        .expect("an enabled bucket's delete returns a marker id");
+    assert_ne!(marker, ObjectVersion::unversioned());
+
+    let latest = store.get(&bucket, "k", None).await.expect("get").expect("row");
+    assert_eq!(latest.version, marker);
+    assert!(latest.delete_marker);
+}
+
+pub(crate) async fn delete_on_a_suspended_bucket_marks_null(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Suspended).await;
+    store.put(&bucket, sample_metadata("k", "v1")).await.expect("put");
+
+    let marker = store
+        .delete(&bucket, "k")
+        .await
+        .expect("delete")
+        .expect("a suspended bucket's delete returns a marker");
+    assert_eq!(marker, ObjectVersion::unversioned());
+
+    let latest = store.get(&bucket, "k", None).await.expect("get").expect("row");
+    assert!(latest.delete_marker);
+    assert_eq!(latest.version, ObjectVersion::unversioned());
+}
+
+pub(crate) async fn delete_on_an_unversioned_bucket_hard_removes_and_returns_none(
+    store: impl MetadataStore,
+) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
+    store.put(&bucket, sample_metadata("k", "v1")).await.expect("put");
+
+    let result = store.delete(&bucket, "k").await.expect("delete should succeed");
+    assert_eq!(result, None);
+    assert_eq!(store.get(&bucket, "k", None).await.expect("get"), None);
+}
+
 /// Emits one `#[tokio::test]` that runs `$name` from this module against a
 /// fresh store from `$make_store`.
 macro_rules! metadata_store_conformance_case {
@@ -1056,6 +1127,10 @@ macro_rules! metadata_store_conformance {
             case!($make_store, put_rejects_a_pre_epoch_cloned_at);
             case!($make_store, all_fields_round_trip);
             case!($make_store, an_unknown_content_type_round_trips_verbatim);
+            case!($make_store, put_on_a_suspended_bucket_overwrites_null_and_keeps_versioned_history);
+            case!($make_store, delete_on_an_enabled_bucket_returns_a_generated_marker_id);
+            case!($make_store, delete_on_a_suspended_bucket_marks_null);
+            case!($make_store, delete_on_an_unversioned_bucket_hard_removes_and_returns_none);
             case!($make_store, metadata_store_is_object_safe);
         }
     };
