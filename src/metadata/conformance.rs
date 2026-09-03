@@ -774,11 +774,12 @@ pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl Metad
 }
 
 pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl MetadataStore) {
-    // The ghost `Bucket` literal is `OBJECT_OWNER`; the real bucket below is
-    // created under `BUCKET_OWNER`, and the final assertion lists by
-    // `BUCKET_OWNER`. Keep the two owner constants distinct — collapsing them
-    // would let the ghost's owner match the queried owner and blur what this
-    // case isolates (that `list_buckets` never reads `object_metadata`).
+    // This case isolates one property: `list_buckets` reads only the `buckets`
+    // table, never `object_metadata`. The ghost bucket below gets object rows
+    // but no `buckets` row, so it must not appear in the listing. `OBJECT_OWNER`
+    // and `BUCKET_OWNER` are kept as separate constants for readability (object
+    // fixtures vs bucket fixtures); the test does not depend on their values
+    // differing.
     // An object whose bucket has no `buckets` row.
     let ghost = Bucket {
         name: "ghost-bucket".to_string(),
