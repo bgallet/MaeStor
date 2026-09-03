@@ -125,27 +125,12 @@ impl std::error::Error for MetadataError {}
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
-    async fn put_versioned(&self, metadata: Metadata) -> Result<(), MetadataError>;
-    async fn put_unversioned(&self, metadata: Metadata) -> Result<(), MetadataError>;
     async fn get(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         key: &str,
         version: Option<&ObjectVersion>,
     ) -> Result<Option<Metadata>, MetadataError>;
-    async fn delete_versioned(
-        &self,
-        bucket: &str,
-        key: &str,
-        new_version: ObjectVersion,
-    ) -> Result<(), MetadataError>;
-    async fn delete_specific_version(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: &ObjectVersion,
-    ) -> Result<(), MetadataError>;
-    async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
 
     /// The S3 object write. Branches on `bucket.versioning`: an `Enabled`
     /// bucket inserts a new version at `metadata.version`; a `Suspended` or
@@ -165,12 +150,12 @@ pub trait MetadataStore: Send + Sync {
 
     async fn list(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
     async fn list_versions(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
     /// Every bucket owned by `owner` — full [`Bucket`] rows, ascending by

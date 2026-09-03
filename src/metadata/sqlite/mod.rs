@@ -217,6 +217,78 @@ impl SqliteMetadataStore {
         }
         Ok(())
     }
+
+    /// Demotes the current latest row for `(metadata.bucket, metadata.key)` and
+    /// upserts `metadata` as the new latest, in one transaction. When
+    /// `demote_excludes_self` is set, a row whose `version` matches
+    /// `metadata.version` is left untouched by the demote — the upsert re-marks
+    /// it latest anyway (the unversioned-overwrite case). `metadata.is_latest`
+    /// is the caller's to set.
+    async fn insert_row_as_latest(
+        &self,
+        metadata: &Metadata,
+        demote_excludes_self: bool,
+    ) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
+
+        if demote_excludes_self {
+            sqlx::query(
+                "UPDATE object_metadata SET is_latest = 0
+                 WHERE bucket = ? AND key = ? AND is_latest = 1 AND version <> ?",
+            )
+            .bind(&metadata.bucket)
+            .bind(&metadata.key)
+            .bind(&metadata.version.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(MetadataError::Backend)?;
+        } else {
+            sqlx::query(
+                "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
+            )
+            .bind(&metadata.bucket)
+            .bind(&metadata.key)
+            .execute(&mut *tx)
+            .await
+            .map_err(MetadataError::Backend)?;
+        }
+
+        upsert_row(&mut *tx, metadata).await?;
+
+        tx.commit().await.map_err(MetadataError::Backend)
+    }
+
+    /// Writes a delete marker for `(bucket, key)` at `version` as the new latest
+    /// row, demoting whatever row currently holds that flag.
+    async fn insert_delete_marker(
+        &self,
+        bucket: &Bucket,
+        key: &str,
+        version: ObjectVersion,
+    ) -> Result<(), MetadataError> {
+        let marker = Metadata {
+            etag: Etag(Bytes::new()),
+            last_modified: SystemTime::now(),
+            size: 0,
+            cache_control: CacheControl(String::new()),
+            backend_id: 0,
+            bucket: bucket.name.clone(),
+            key: key.to_string(),
+            content_type: None,
+            content_disposition: None,
+            content_language: None,
+            version,
+            cloned_at: None,
+            upload_id: None,
+            is_latest: true,
+            delete_marker: true,
+            user_metadata: HashMap::new(),
+            storage_class: ObjectStorageClass::Standard,
+            encryption_context: None,
+        };
+
+        self.insert_row_as_latest(&marker, false).await
+    }
 }
 
 /// Builds the `list_batch` query string for a given batch shape, with `?`
@@ -590,54 +662,9 @@ where
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
-    async fn put_versioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.is_latest = true;
-
-        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
-
-        sqlx::query(
-            "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
-        )
-        .bind(&metadata.bucket)
-        .bind(&metadata.key)
-        .execute(&mut *tx)
-        .await
-        .map_err(MetadataError::Backend)?;
-
-        upsert_row(&mut *tx, &metadata).await?;
-
-        tx.commit().await.map_err(MetadataError::Backend)
-    }
-
-    async fn put_unversioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.version = ObjectVersion::unversioned();
-        metadata.is_latest = true;
-
-        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
-
-        // Versioned rows may already exist for this key (a bucket whose
-        // versioning was suspended). Demote whichever of them is currently
-        // latest — but never the sentinel row itself, since the upsert below
-        // re-marks it latest anyway.
-        sqlx::query(
-            "UPDATE object_metadata SET is_latest = 0
-             WHERE bucket = ? AND key = ? AND is_latest = 1 AND version <> ?",
-        )
-        .bind(&metadata.bucket)
-        .bind(&metadata.key)
-        .bind(&metadata.version.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(MetadataError::Backend)?;
-
-        upsert_row(&mut *tx, &metadata).await?;
-
-        tx.commit().await.map_err(MetadataError::Backend)
-    }
-
     async fn get(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         key: &str,
         version: Option<&ObjectVersion>,
     ) -> Result<Option<Metadata>, MetadataError> {
@@ -646,7 +673,7 @@ impl MetadataStore for SqliteMetadataStore {
                 sqlx::query(
                     "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?",
                 )
-                .bind(bucket)
+                .bind(&bucket.name)
                 .bind(key)
                 .bind(&version.0)
                 .fetch_optional(&self.pool)
@@ -656,7 +683,7 @@ impl MetadataStore for SqliteMetadataStore {
                 sqlx::query(
                     "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1",
                 )
-                .bind(bucket)
+                .bind(&bucket.name)
                 .bind(key)
                 .fetch_optional(&self.pool)
                 .await
@@ -667,46 +694,62 @@ impl MetadataStore for SqliteMetadataStore {
         row.map(|row| row_to_metadata(&row)).transpose()
     }
 
-    async fn delete_versioned(
-        &self,
-        bucket: &str,
-        key: &str,
-        new_version: ObjectVersion,
-    ) -> Result<(), MetadataError> {
-        let marker = Metadata {
-            etag: Etag(Bytes::new()),
-            last_modified: SystemTime::now(),
-            size: 0,
-            cache_control: CacheControl(String::new()),
-            backend_id: 0,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            content_type: None,
-            content_disposition: None,
-            content_language: None,
-            version: new_version,
-            cloned_at: None,
-            upload_id: None,
-            is_latest: true,
-            delete_marker: true,
-            user_metadata: HashMap::new(),
-            storage_class: ObjectStorageClass::Standard,
-            encryption_context: None,
-        };
-
-        self.put_versioned(marker).await
+    async fn put(&self, bucket: &Bucket, mut metadata: Metadata) -> Result<(), MetadataError> {
+        metadata.bucket = bucket.name.clone();
+        metadata.is_latest = true;
+        match bucket.versioning {
+            BucketVersioning::Enabled => self.insert_row_as_latest(&metadata, false).await,
+            BucketVersioning::Suspended | BucketVersioning::Unversioned => {
+                // Versioned rows may already exist for this key (a bucket whose
+                // versioning was suspended); the demote leaves the sentinel row
+                // alone since the upsert re-marks it latest anyway.
+                metadata.version = ObjectVersion::unversioned();
+                self.insert_row_as_latest(&metadata, true).await
+            }
+        }
     }
 
-    async fn delete_specific_version(
+    async fn delete(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
+        key: &str,
+    ) -> Result<Option<ObjectVersion>, MetadataError> {
+        match bucket.versioning {
+            BucketVersioning::Enabled => {
+                let marker = new_version_id();
+                self.insert_delete_marker(bucket, key, marker.clone()).await?;
+                Ok(Some(marker))
+            }
+            BucketVersioning::Suspended => {
+                let null = ObjectVersion::unversioned();
+                self.insert_delete_marker(bucket, key, null.clone()).await?;
+                Ok(Some(null))
+            }
+            BucketVersioning::Unversioned => {
+                sqlx::query(
+                    "DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?",
+                )
+                .bind(&bucket.name)
+                .bind(key)
+                .bind(&ObjectVersion::unversioned().0)
+                .execute(&self.pool)
+                .await
+                .map_err(MetadataError::Backend)?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn delete_version(
+        &self,
+        bucket: &Bucket,
         key: &str,
         version: &ObjectVersion,
     ) -> Result<(), MetadataError> {
         let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
 
         sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
-            .bind(bucket)
+            .bind(&bucket.name)
             .bind(key)
             .bind(&version.0)
             .execute(&mut *tx)
@@ -725,9 +768,9 @@ impl MetadataStore for SqliteMetadataStore {
                  SELECT 1 FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1
              )",
         )
-        .bind(bucket)
+        .bind(&bucket.name)
         .bind(key)
-        .bind(bucket)
+        .bind(&bucket.name)
         .bind(key)
         .execute(&mut *tx)
         .await
@@ -736,74 +779,20 @@ impl MetadataStore for SqliteMetadataStore {
         tx.commit().await.map_err(MetadataError::Backend)
     }
 
-    async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
-        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
-            .bind(bucket)
-            .bind(key)
-            .bind(&ObjectVersion::unversioned().0)
-            .execute(&self.pool)
-            .await
-            .map_err(MetadataError::Backend)?;
-
-        Ok(())
-    }
-
-    async fn put(&self, bucket: &Bucket, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.bucket = bucket.name.clone();
-        match bucket.versioning {
-            BucketVersioning::Enabled => self.put_versioned(metadata).await,
-            BucketVersioning::Suspended | BucketVersioning::Unversioned => {
-                self.put_unversioned(metadata).await
-            }
-        }
-    }
-
-    async fn delete(
-        &self,
-        bucket: &Bucket,
-        key: &str,
-    ) -> Result<Option<ObjectVersion>, MetadataError> {
-        match bucket.versioning {
-            BucketVersioning::Enabled => {
-                let marker = new_version_id();
-                self.delete_versioned(&bucket.name, key, marker.clone()).await?;
-                Ok(Some(marker))
-            }
-            BucketVersioning::Suspended => {
-                let null = ObjectVersion::unversioned();
-                self.delete_versioned(&bucket.name, key, null.clone()).await?;
-                Ok(Some(null))
-            }
-            BucketVersioning::Unversioned => {
-                self.delete_unversioned(&bucket.name, key).await?;
-                Ok(None)
-            }
-        }
-    }
-
-    async fn delete_version(
-        &self,
-        bucket: &Bucket,
-        key: &str,
-        version: &ObjectVersion,
-    ) -> Result<(), MetadataError> {
-        self.delete_specific_version(&bucket.name, key, version).await
-    }
-
     async fn list(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError> {
-        self.list_page(bucket, params, true).await
+        self.list_page(&bucket.name, params, true).await
     }
 
     async fn list_versions(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError> {
-        self.list_page(bucket, params, false).await
+        self.list_page(&bucket.name, params, false).await
     }
 
     async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError> {

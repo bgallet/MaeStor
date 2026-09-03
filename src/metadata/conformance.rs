@@ -106,9 +106,9 @@ async fn collect_all(
             max_keys: page_size,
         };
         let page: ListPage = if versions {
-            store.list_versions(&bucket.name, params).await
+            store.list_versions(bucket, params).await
         } else {
-            store.list(&bucket.name, params).await
+            store.list(bucket, params).await
         }
         .expect("list should succeed");
 
@@ -145,7 +145,7 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
     assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 2);
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a latest row should exist");
@@ -153,7 +153,7 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
     assert!(latest.is_latest);
 
     let previous = store
-        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("v1 should still exist");
@@ -179,7 +179,7 @@ pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataSto
     assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 1);
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -200,7 +200,7 @@ pub(crate) async fn get_with_no_version_returns_the_latest_row(store: impl Metad
         .expect("put should succeed");
 
     let found = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -221,7 +221,7 @@ pub(crate) async fn get_with_a_specific_version_returns_that_version_even_if_not
         .expect("put should succeed");
 
     let found = store
-        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -241,7 +241,7 @@ pub(crate) async fn get_returns_none_for_a_key_that_was_never_written(store: imp
         lifecycle: None,
     };
     let found = store
-        .get(&bucket.name, "no-such-key", None)
+        .get(&bucket, "no-such-key", None)
         .await
         .expect("get should succeed");
     assert_eq!(found, None);
@@ -261,7 +261,7 @@ pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: i
         .expect("an enabled bucket returns a marker");
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -269,7 +269,7 @@ pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: i
     assert!(latest.delete_marker);
 
     let original = store
-        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("original version should still exist");
@@ -294,7 +294,7 @@ pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl Me
 
     assert_eq!(versions_for_key(&store, &bucket, "k").await.len(), 1);
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -320,7 +320,7 @@ pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_la
         .expect("delete should succeed");
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("v1 should have been promoted to latest");
@@ -342,7 +342,7 @@ pub(crate) async fn delete_unversioned_removes_the_sentinel_row(store: impl Meta
     assert_eq!(marker, None);
 
     let found = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed");
     assert_eq!(found, None);
@@ -449,7 +449,7 @@ pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataSt
     loop {
         let page = store
             .list(
-                &bucket.name,
+                &bucket,
                 ListParams { prefix: None, delimiter: None, cursor: cursor.as_deref(), max_keys: 2 },
             )
             .await
@@ -478,14 +478,14 @@ pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl Metadat
     }
 
     let page1 = store
-        .list(&bucket.name, ListParams { prefix: None, delimiter: None, cursor: None, max_keys: 2 })
+        .list(&bucket, ListParams { prefix: None, delimiter: None, cursor: None, max_keys: 2 })
         .await
         .expect("list should succeed");
     let cursor = page1.next_cursor.expect("first page of four is truncated");
 
     let page2 = store
         .list(
-            &bucket.name,
+            &bucket,
             ListParams { prefix: None, delimiter: None, cursor: Some(&cursor), max_keys: 2 },
         )
         .await
@@ -499,7 +499,7 @@ pub(crate) async fn list_of_an_empty_bucket_is_an_empty_page(store: impl Metadat
     let bucket = fresh_bucket(&store, "no-such-bucket", BucketVersioning::Unversioned).await;
     let page = store
         .list(
-            &bucket.name,
+            &bucket,
             ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 100 },
         )
         .await
@@ -552,7 +552,7 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
 
     let page1 = store
         .list(
-            &bucket.name,
+            &bucket,
             ListParams { prefix: None, delimiter: Some("/"), cursor: None, max_keys: 1 },
         )
         .await
@@ -563,7 +563,7 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
 
     let page2 = store
         .list(
-            &bucket.name,
+            &bucket,
             ListParams {
                 prefix: None,
                 delimiter: Some("/"),
@@ -583,7 +583,7 @@ pub(crate) async fn list_rejects_a_malformed_cursor(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let err = store
         .list(
-            &bucket.name,
+            &bucket,
             ListParams {
                 prefix: None,
                 delimiter: None,
@@ -708,7 +708,7 @@ pub(crate) async fn delete_bucket_leaves_its_objects_untouched(store: impl Metad
     store.delete_bucket("b").await.expect("delete_bucket should succeed");
 
     let object = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed");
     assert!(object.is_some(), "the object should survive its bucket's deletion");
@@ -822,7 +822,7 @@ pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
         .expect("put should succeed");
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a latest row should be found");
@@ -850,7 +850,7 @@ pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
         .expect("second put should succeed");
 
     let latest = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("the sentinel row should still be latest");
@@ -937,7 +937,7 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
         .expect("put should succeed");
 
     let found = store
-        .get(&bucket.name, "deep/key/name", None)
+        .get(&bucket, "deep/key/name", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -955,7 +955,7 @@ pub(crate) async fn an_unknown_content_type_round_trips_verbatim(store: impl Met
         .expect("put should succeed");
 
     let found = store
-        .get(&bucket.name, "k", None)
+        .get(&bucket, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
