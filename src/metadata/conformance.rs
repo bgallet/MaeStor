@@ -31,14 +31,13 @@ use crate::metadata::{
 /// A metadata record with every optional field left empty, for tests that only
 /// care about a couple of fields. `is_latest` starts `false`; the `put_*`
 /// methods set it themselves.
-pub(crate) fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadata {
+pub(crate) fn sample_metadata(key: &str, version: &str) -> Metadata {
     Metadata {
         etag: Etag(Bytes::from_static(b"\"etag\"")),
         last_modified: SystemTime::now(),
         size: 10,
         cache_control: CacheControl("no-cache".to_string()),
         backend_id: 1,
-        bucket: bucket.to_string(),
         key: key.to_string(),
         content_type: Some(ContentType::parse("text/plain")),
         content_disposition: None,
@@ -134,11 +133,11 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("first put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("second put should succeed");
 
@@ -162,14 +161,14 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
 
 pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
-    let mut first = sample_metadata("b", "k", "ignored");
+    let mut first = sample_metadata("k", "ignored");
     first.size = 10;
     store
         .put(&bucket, first)
         .await
         .expect("first put should succeed");
 
-    let mut second = sample_metadata("b", "k", "also-ignored");
+    let mut second = sample_metadata("k", "also-ignored");
     second.size = 20;
     store
         .put(&bucket, second)
@@ -191,11 +190,11 @@ pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataSto
 pub(crate) async fn get_with_no_version_returns_the_latest_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("put should succeed");
 
@@ -212,11 +211,11 @@ pub(crate) async fn get_with_a_specific_version_returns_that_version_even_if_not
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("put should succeed");
 
@@ -250,7 +249,7 @@ pub(crate) async fn get_returns_none_for_a_key_that_was_never_written(store: imp
 pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
 
@@ -279,11 +278,11 @@ pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: i
 pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("put should succeed");
 
@@ -306,11 +305,11 @@ pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_la
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("put should succeed");
 
@@ -331,7 +330,7 @@ pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_la
 pub(crate) async fn delete_unversioned_removes_the_sentinel_row(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("k", "ignored"))
         .await
         .expect("put should succeed");
 
@@ -352,19 +351,19 @@ pub(crate) async fn list_returns_latest_rows_for_a_bucket(store: impl MetadataSt
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     let other = fresh_bucket(&store, "other-bucket", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "a", "v1"))
+        .put(&bucket, sample_metadata("a", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "a", "v2"))
+        .put(&bucket, sample_metadata("a", "v2"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "c", "v1"))
+        .put(&bucket, sample_metadata("c", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&other, sample_metadata("other-bucket", "a", "v1"))
+        .put(&other, sample_metadata("a", "v1"))
         .await
         .expect("put should succeed");
 
@@ -377,15 +376,15 @@ pub(crate) async fn list_returns_latest_rows_for_a_bucket(store: impl MetadataSt
 pub(crate) async fn list_filters_by_prefix(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put(&bucket, sample_metadata("b", "docs/a", "v1"))
+        .put(&bucket, sample_metadata("docs/a", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "docs/b", "v1"))
+        .put(&bucket, sample_metadata("docs/b", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "images/c", "v1"))
+        .put(&bucket, sample_metadata("images/c", "v1"))
         .await
         .expect("put should succeed");
 
@@ -399,11 +398,11 @@ pub(crate) async fn list_prefix_does_not_treat_percent_or_underscore_as_wildcard
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put(&bucket, sample_metadata("b", "100%_off", "v1"))
+        .put(&bucket, sample_metadata("100%_off", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "100X_off", "v1"))
+        .put(&bucket, sample_metadata("100X_off", "v1"))
         .await
         .expect("put should succeed");
 
@@ -417,7 +416,7 @@ pub(crate) async fn list_versions_returns_every_version_including_markers(
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     let marker = store
@@ -438,7 +437,7 @@ pub(crate) async fn list_paginates_and_reports_truncation(store: impl MetadataSt
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["k1", "k2", "k3", "k4", "k5"] {
         store
-            .put(&bucket, sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata(key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -472,7 +471,7 @@ pub(crate) async fn list_final_exact_page_has_no_next_cursor(store: impl Metadat
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["k1", "k2", "k3", "k4"] {
         store
-            .put(&bucket, sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata(key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -513,7 +512,7 @@ pub(crate) async fn list_groups_keys_under_a_delimiter(store: impl MetadataStore
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["a", "p/1", "p/2", "q/1", "z"] {
         store
-            .put(&bucket, sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata(key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -529,7 +528,7 @@ pub(crate) async fn list_delimiter_respects_prefix(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["p/x", "p/sub/a", "p/sub/b"] {
         store
-            .put(&bucket, sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata(key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -545,7 +544,7 @@ pub(crate) async fn list_delimiter_page_ends_on_a_common_prefix(store: impl Meta
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     for key in ["g/1", "g/2", "g/3", "g/4", "z"] {
         store
-            .put(&bucket, sample_metadata("b", key, "v1"))
+            .put(&bucket, sample_metadata(key, "v1"))
             .await
             .expect("put should succeed");
     }
@@ -604,13 +603,13 @@ pub(crate) async fn list_versions_paginates_across_keys_and_versions(store: impl
     // k1 gets three versions, k2 gets two.
     for version in ["v1", "v2", "v3"] {
         store
-            .put(&bucket, sample_metadata("b", "k1", version))
+            .put(&bucket, sample_metadata("k1", version))
             .await
             .expect("put should succeed");
     }
     for version in ["v1", "v2"] {
         store
-            .put(&bucket, sample_metadata("b", "k2", version))
+            .put(&bucket, sample_metadata("k2", version))
             .await
             .expect("put should succeed");
     }
@@ -701,7 +700,7 @@ pub(crate) async fn delete_bucket_removes_the_row_and_is_idempotent(store: impl 
 pub(crate) async fn delete_bucket_leaves_its_objects_untouched(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
 
@@ -787,7 +786,7 @@ pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl Metadat
         lifecycle: None,
     };
     store
-        .put(&ghost, sample_metadata("ghost-bucket", "k", "v1"))
+        .put(&ghost, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store.create_bucket("real", BUCKET_OWNER).await.expect("create should succeed");
@@ -802,11 +801,11 @@ pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("k", "v2"))
         .await
         .expect("put should succeed");
 
@@ -817,7 +816,7 @@ pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
     let bucket = store.get_bucket("b").await.expect("get").expect("exists");
 
     store
-        .put(&bucket, sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("k", "ignored"))
         .await
         .expect("put should succeed");
 
@@ -841,11 +840,11 @@ pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
 ) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put(&bucket, sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("k", "ignored"))
         .await
         .expect("first put should succeed");
     store
-        .put(&bucket, sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("k", "ignored"))
         .await
         .expect("second put should succeed");
 
@@ -860,7 +859,7 @@ pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
 
 pub(crate) async fn put_rejects_a_pre_epoch_last_modified(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
-    let mut metadata = sample_metadata("b", "k", "v1");
+    let mut metadata = sample_metadata("k", "v1");
     metadata.last_modified = UNIX_EPOCH - Duration::from_secs(60);
 
     let err = store
@@ -881,7 +880,7 @@ pub(crate) async fn put_rejects_a_pre_epoch_last_modified(store: impl MetadataSt
 
 pub(crate) async fn put_rejects_a_pre_epoch_cloned_at(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
-    let mut metadata = sample_metadata("b", "k", "v1");
+    let mut metadata = sample_metadata("k", "v1");
     metadata.cloned_at = Some(UNIX_EPOCH - Duration::from_secs(60));
 
     let err = store
@@ -909,7 +908,6 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
         size: 4096,
         cache_control: CacheControl("max-age=3600".to_string()),
         backend_id: 7,
-        bucket: "b".to_string(),
         key: "deep/key/name".to_string(),
         // Exact match — round-trips through the one-byte known-type code.
         content_type: Some(ContentType::parse("application/json")),
@@ -946,7 +944,7 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
 
 pub(crate) async fn an_unknown_content_type_round_trips_verbatim(store: impl MetadataStore) {
     let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
-    let mut metadata = sample_metadata("b", "k", "v1");
+    let mut metadata = sample_metadata("k", "v1");
     metadata.content_type = Some(ContentType::Other("application/vnd.acme+special".to_string()));
 
     store

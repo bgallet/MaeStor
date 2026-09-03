@@ -218,7 +218,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
-    /// Demotes the current latest row for `(metadata.bucket, metadata.key)` and
+    /// Demotes the current latest row for `(bucket_name, metadata.key)` and
     /// upserts `metadata` as the new latest, in one transaction. When
     /// `demote_excludes_self` is set, a row whose `version` matches
     /// `metadata.version` is left untouched by the demote — the upsert re-marks
@@ -226,6 +226,7 @@ impl SqliteMetadataStore {
     /// is the caller's to set.
     async fn insert_row_as_latest(
         &self,
+        bucket_name: &str,
         metadata: &Metadata,
         demote_excludes_self: bool,
     ) -> Result<(), MetadataError> {
@@ -236,7 +237,7 @@ impl SqliteMetadataStore {
                 "UPDATE object_metadata SET is_latest = 0
                  WHERE bucket = ? AND key = ? AND is_latest = 1 AND version <> ?",
             )
-            .bind(&metadata.bucket)
+            .bind(bucket_name)
             .bind(&metadata.key)
             .bind(&metadata.version.0)
             .execute(&mut *tx)
@@ -246,14 +247,14 @@ impl SqliteMetadataStore {
             sqlx::query(
                 "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
             )
-            .bind(&metadata.bucket)
+            .bind(bucket_name)
             .bind(&metadata.key)
             .execute(&mut *tx)
             .await
             .map_err(MetadataError::Backend)?;
         }
 
-        upsert_row(&mut *tx, metadata).await?;
+        upsert_row(&mut *tx, bucket_name, metadata).await?;
 
         tx.commit().await.map_err(MetadataError::Backend)
     }
@@ -272,7 +273,6 @@ impl SqliteMetadataStore {
             size: 0,
             cache_control: CacheControl(String::new()),
             backend_id: 0,
-            bucket: bucket.name.clone(),
             key: key.to_string(),
             content_type: None,
             content_disposition: None,
@@ -287,7 +287,7 @@ impl SqliteMetadataStore {
             encryption_context: None,
         };
 
-        self.insert_row_as_latest(&marker, false).await
+        self.insert_row_as_latest(&bucket.name, &marker, false).await
     }
 }
 
@@ -526,7 +526,6 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
         size,
         cache_control: CacheControl(row.try_get("cache_control").map_err(MetadataError::Backend)?),
         backend_id,
-        bucket: row.try_get("bucket").map_err(MetadataError::Backend)?,
         key: row.try_get("key").map_err(MetadataError::Backend)?,
         content_type: row
             .try_get::<Option<Vec<u8>>, _>("content_type")
@@ -590,7 +589,11 @@ fn row_to_bucket(row: &SqliteRow) -> Result<Bucket, MetadataError> {
     })
 }
 
-async fn upsert_row<'e, E>(executor: E, metadata: &Metadata) -> Result<(), MetadataError>
+async fn upsert_row<'e, E>(
+    executor: E,
+    bucket_name: &str,
+    metadata: &Metadata,
+) -> Result<(), MetadataError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -635,7 +638,7 @@ where
             storage_class = excluded.storage_class,
             encryption_context = excluded.encryption_context",
     )
-    .bind(&metadata.bucket)
+    .bind(bucket_name)
     .bind(&metadata.key)
     .bind(&metadata.version.0)
     .bind(metadata.etag.0.to_vec())
@@ -695,16 +698,17 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn put(&self, bucket: &Bucket, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.bucket = bucket.name.clone();
         metadata.is_latest = true;
         match bucket.versioning {
-            BucketVersioning::Enabled => self.insert_row_as_latest(&metadata, false).await,
+            BucketVersioning::Enabled => {
+                self.insert_row_as_latest(&bucket.name, &metadata, false).await
+            }
             BucketVersioning::Suspended | BucketVersioning::Unversioned => {
                 // Versioned rows may already exist for this key (a bucket whose
                 // versioning was suspended); the demote leaves the sentinel row
                 // alone since the upsert re-marks it latest anyway.
                 metadata.version = ObjectVersion::unversioned();
-                self.insert_row_as_latest(&metadata, true).await
+                self.insert_row_as_latest(&bucket.name, &metadata, true).await
             }
         }
     }
@@ -960,7 +964,6 @@ mod tests {
 
         let metadata = row_to_metadata(&row).expect("row should decode");
 
-        assert_eq!(metadata.bucket, "my-bucket");
         assert_eq!(metadata.key, "my-key");
         assert_eq!(metadata.version, ObjectVersion("v1".to_string()));
         assert_eq!(metadata.etag, Etag(Bytes::from_static(b"\"abc123\"")));

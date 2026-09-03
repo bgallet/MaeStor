@@ -21,7 +21,6 @@ pub struct Metadata {
     pub size: usize,
     pub cache_control: CacheControl,
     pub backend_id: usize,
-    pub bucket: String,
     pub key: String,
     pub content_type: Option<ContentType>,
     pub content_disposition: Option<String>,
@@ -224,7 +223,6 @@ mod tests {
             size: 42,
             cache_control: CacheControl("no-cache".to_string()),
             backend_id: 1,
-            bucket: "my-bucket".to_string(),
             key: "my-key".to_string(),
             content_type: Some(ContentType::parse("text/plain")),
             content_disposition: None,
@@ -238,7 +236,6 @@ mod tests {
             storage_class: ObjectStorageClass::Standard,
             encryption_context: None,
         };
-        assert_eq!(metadata.bucket, "my-bucket");
         assert!(metadata.is_latest);
     }
 
