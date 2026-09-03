@@ -260,6 +260,14 @@ fn millis_to_system_time(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis as u64)
 }
 
+/// A fresh, time-sortable object version id (UUIDv7). Used for
+/// store-generated delete-marker ids; the 48-bit millisecond prefix makes
+/// successive ids sort in creation order by the `version` column alone.
+#[allow(dead_code)] // gains a caller in the next task
+fn new_version_id() -> ObjectVersion {
+    ObjectVersion(uuid::Uuid::now_v7().to_string())
+}
+
 /// Encodes a content type for the `content_type` BLOB column: a known type is
 /// its one-byte code, anything else is its raw UTF-8. An `Other` shorter than
 /// two bytes is rejected — it could not be told apart from a known-type code
@@ -1104,6 +1112,26 @@ mod tests {
     #[test]
     fn delimiter_group_supports_a_multi_char_delimiter() {
         assert_eq!(delimiter_group("aXXbXXc", "", "XX").as_deref(), Some("aXX"));
+    }
+
+    #[test]
+    fn new_version_id_is_a_distinct_uuid_each_call() {
+        let a = new_version_id();
+        let b = new_version_id();
+        assert_ne!(a, b);
+        // UUID string form: 36 chars, and the version nibble (char 14) is '7'.
+        assert_eq!(a.0.len(), 36, "{}", a.0);
+        assert_eq!(a.0.as_bytes()[14], b'7', "expected a v7 UUID: {}", a.0);
+    }
+
+    #[test]
+    fn new_version_id_is_time_sortable() {
+        // v7 embeds a millisecond timestamp prefix, so a later id sorts after
+        // an earlier one lexicographically. A tiny sleep guarantees a tick.
+        let a = new_version_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = new_version_id();
+        assert!(a.0 < b.0, "{} should sort before {}", a.0, b.0);
     }
 
     #[test]
