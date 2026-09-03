@@ -36,6 +36,20 @@ pub struct Metadata {
     pub encryption_context: Option<DataEncryptionContext>,
 }
 
+/// A bucket's stored metadata. `acl` / `cors` / `lifecycle` are the raw
+/// configuration documents as S3 receives them; `None` means unconfigured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bucket {
+    pub name: String,
+    pub owner: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    pub versioning: BucketVersioning,
+    pub acl: Option<Bytes>,
+    pub cors: Option<Bytes>,
+    pub lifecycle: Option<Bytes>,
+}
+
 /// Query parameters for a single page of a list operation.
 #[derive(Debug, Clone, Copy)]
 pub struct ListParams<'a> {
@@ -83,6 +97,10 @@ pub enum MetadataError {
     /// `Corrupt` (a stored-data or logic fault): this is a client error and
     /// maps to `InvalidArgument` / 400 once a handler consumes it.
     InvalidCursor { detail: String },
+    /// `create_bucket` on a name that is already taken.
+    BucketAlreadyExists { name: String },
+    /// A `set_bucket_*` call against a bucket that does not exist.
+    NoSuchBucket { name: String },
 }
 
 impl std::fmt::Display for MetadataError {
@@ -95,6 +113,10 @@ impl std::fmt::Display for MetadataError {
             MetadataError::InvalidCursor { detail } => {
                 write!(f, "invalid page cursor: {detail}")
             }
+            MetadataError::BucketAlreadyExists { name } => {
+                write!(f, "bucket already exists: {name}")
+            }
+            MetadataError::NoSuchBucket { name } => write!(f, "no such bucket: {name}"),
         }
     }
 }
@@ -195,5 +217,13 @@ mod tests {
         let rendered = format!("{err}");
         assert!(rendered.contains("invalid page cursor"), "{rendered}");
         assert!(rendered.contains("not valid base64"), "{rendered}");
+    }
+
+    #[test]
+    fn metadata_error_displays_the_bucket_variants() {
+        let exists = MetadataError::BucketAlreadyExists { name: "b".to_string() };
+        assert!(format!("{exists}").contains("bucket already exists: b"), "{exists}");
+        let missing = MetadataError::NoSuchBucket { name: "b".to_string() };
+        assert!(format!("{missing}").contains("no such bucket: b"), "{missing}");
     }
 }
