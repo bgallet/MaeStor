@@ -3,6 +3,8 @@
 Date: 2026-08-22
 Status: Approved
 
+> Bucket-level configuration and the `list_buckets` shape are superseded by `2026-09-03-bucket-metadata-design.md`.
+
 ## Context
 
 `open-conductor` needs its own metadata system for tracking objects independently of wherever their bytes actually live — the design that shaped the routing layer explicitly deferred this ("How the metadata abstraction trait is shaped, and what the SQLite implementation looks like"). This document is that sub-project: a `MetadataStore` trait abstracting persistence, with SQLite as the first implementation.

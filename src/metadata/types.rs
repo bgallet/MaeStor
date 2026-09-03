@@ -217,6 +217,37 @@ impl fmt::Display for ObjectStorageClass {
     }
 }
 
+/// A bucket's S3 versioning state. A never-configured bucket is
+/// `Unversioned`; once configured it only toggles `Enabled` <-> `Suspended`
+/// and never returns to `Unversioned`. The store does not police that
+/// transition — see the design doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BucketVersioning {
+    #[default]
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+impl BucketVersioning {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BucketVersioning::Unversioned => "UNVERSIONED",
+            BucketVersioning::Enabled => "ENABLED",
+            BucketVersioning::Suspended => "SUSPENDED",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "UNVERSIONED" => Some(BucketVersioning::Unversioned),
+            "ENABLED" => Some(BucketVersioning::Enabled),
+            "SUSPENDED" => Some(BucketVersioning::Suspended),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DataEncryptionContext;
 
@@ -262,6 +293,28 @@ mod tests {
     #[test]
     fn storage_class_display_matches_as_str() {
         assert_eq!(format!("{}", ObjectStorageClass::Glacier), "GLACIER");
+    }
+
+    #[test]
+    fn bucket_versioning_round_trips_through_its_wire_string() {
+        for state in [
+            BucketVersioning::Unversioned,
+            BucketVersioning::Enabled,
+            BucketVersioning::Suspended,
+        ] {
+            assert_eq!(BucketVersioning::parse(state.as_str()), Some(state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn bucket_versioning_parse_rejects_unknown_strings() {
+        assert_eq!(BucketVersioning::parse("MaybeEnabled"), None);
+        assert_eq!(BucketVersioning::parse(""), None);
+    }
+
+    #[test]
+    fn bucket_versioning_default_is_unversioned() {
+        assert_eq!(BucketVersioning::default(), BucketVersioning::Unversioned);
     }
 
     #[test]

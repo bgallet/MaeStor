@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 pub use types::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ObjectStorageClass,
-    ObjectVersion,
+    BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType,
+    ObjectStorageClass, ObjectVersion,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +21,6 @@ pub struct Metadata {
     pub size: usize,
     pub cache_control: CacheControl,
     pub backend_id: usize,
-    pub bucket: String,
     pub key: String,
     pub content_type: Option<ContentType>,
     pub content_disposition: Option<String>,
@@ -34,6 +33,20 @@ pub struct Metadata {
     pub user_metadata: HashMap<String, Bytes>,
     pub storage_class: ObjectStorageClass,
     pub encryption_context: Option<DataEncryptionContext>,
+}
+
+/// A bucket's stored metadata. `acl` / `cors` / `lifecycle` are the raw
+/// configuration documents as S3 receives them; `None` means unconfigured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bucket {
+    pub name: String,
+    pub owner: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    pub versioning: BucketVersioning,
+    pub acl: Option<Bytes>,
+    pub cors: Option<Bytes>,
+    pub lifecycle: Option<Bytes>,
 }
 
 /// Query parameters for a single page of a list operation.
@@ -83,6 +96,10 @@ pub enum MetadataError {
     /// `Corrupt` (a stored-data or logic fault): this is a client error and
     /// maps to `InvalidArgument` / 400 once a handler consumes it.
     InvalidCursor { detail: String },
+    /// `create_bucket` on a name that is already taken.
+    BucketAlreadyExists { name: String },
+    /// A `set_bucket_*` call against a bucket that does not exist.
+    NoSuchBucket { name: String },
 }
 
 impl std::fmt::Display for MetadataError {
@@ -95,6 +112,10 @@ impl std::fmt::Display for MetadataError {
             MetadataError::InvalidCursor { detail } => {
                 write!(f, "invalid page cursor: {detail}")
             }
+            MetadataError::BucketAlreadyExists { name } => {
+                write!(f, "bucket already exists: {name}")
+            }
+            MetadataError::NoSuchBucket { name } => write!(f, "no such bucket: {name}"),
         }
     }
 }
@@ -103,38 +124,88 @@ impl std::error::Error for MetadataError {}
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
-    async fn put_versioned(&self, metadata: Metadata) -> Result<(), MetadataError>;
-    async fn put_unversioned(&self, metadata: Metadata) -> Result<(), MetadataError>;
     async fn get(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         key: &str,
         version: Option<&ObjectVersion>,
     ) -> Result<Option<Metadata>, MetadataError>;
-    async fn delete_versioned(
-        &self,
-        bucket: &str,
-        key: &str,
-        new_version: ObjectVersion,
-    ) -> Result<(), MetadataError>;
-    async fn delete_specific_version(
-        &self,
-        bucket: &str,
-        key: &str,
-        version: &ObjectVersion,
-    ) -> Result<(), MetadataError>;
-    async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
+
+    /// The S3 object write. Branches on `bucket.versioning`: an `Enabled`
+    /// bucket inserts a new version at `metadata.version`; a `Suspended` or
+    /// `Unversioned` bucket overwrites the `"null"` version.
+    async fn put(&self, bucket: &Bucket, metadata: Metadata) -> Result<(), MetadataError>;
+
+    /// The S3 `DELETE` with no version id. `Enabled`: inserts a delete marker
+    /// with a store-generated id (returned). `Suspended`: a delete marker at
+    /// version `"null"` (returns that). `Unversioned`: hard-removes the
+    /// `"null"` row (returns `None`).
+    async fn delete(&self, bucket: &Bucket, key: &str) -> Result<Option<ObjectVersion>, MetadataError>;
+
+    /// The S3 `DELETE` with a client-named version id — removes exactly that
+    /// row and promotes the next-most-recent remaining row to latest if the
+    /// removed one held that flag.
+    async fn delete_version(&self, bucket: &Bucket, key: &str, version: &ObjectVersion) -> Result<(), MetadataError>;
+
     async fn list(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
     async fn list_versions(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
-    async fn list_buckets(&self) -> Result<Vec<String>, MetadataError>;
+    /// Every bucket owned by `owner` — full [`Bucket`] rows, ascending by
+    /// `name`. Not paginated (bucket counts per owner are small, and S3's
+    /// `ListBuckets` is per-caller anyway).
+    async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError>;
+    /// Creates a bucket owned by `owner`, with `created_at == modified_at ==`
+    /// now, `versioning = Unversioned`, and no acl/cors/lifecycle. Returns the
+    /// stored row. `Err(MetadataError::BucketAlreadyExists)` if `name` is
+    /// already taken — bucket names are global, not owner-scoped.
+    async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError>;
+    /// The stored [`Bucket`], or `None` if no bucket has that name. Not
+    /// owner-scoped — S3's bucket namespace is global.
+    async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError>;
+    /// Removes the bucket row. Idempotent — `Ok(())` whether or not it existed.
+    /// Does **not** touch the bucket's objects; the empty-bucket precondition
+    /// for S3 `DeleteBucket` is the handler's to enforce.
+    async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
+    /// Sets the bucket's versioning state and bumps `modified_at` to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist. Does
+    /// not police the `Enabled`/`Suspended`-only transition — it writes
+    /// whatever state it is given; the S3 state machine is a handler concern.
+    async fn set_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioning,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw ACL document, `None` clears it
+    /// (S3 `DeleteBucketAcl`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_acl(
+        &self,
+        name: &str,
+        acl: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw CORS document, `None` clears it
+    /// (S3 `DeleteBucketCors`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_cors(
+        &self,
+        name: &str,
+        cors: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
+    /// `Some(_)` configures the bucket's raw lifecycle document, `None` clears
+    /// it (S3 `DeleteBucketLifecycle`); either way `modified_at` bumps to now.
+    /// `Err(MetadataError::NoSuchBucket)` if the bucket does not exist.
+    async fn set_bucket_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: Option<Bytes>,
+    ) -> Result<(), MetadataError>;
 }
 
 #[cfg(test)]
@@ -152,7 +223,6 @@ mod tests {
             size: 42,
             cache_control: CacheControl("no-cache".to_string()),
             backend_id: 1,
-            bucket: "my-bucket".to_string(),
             key: "my-key".to_string(),
             content_type: Some(ContentType::parse("text/plain")),
             content_disposition: None,
@@ -166,7 +236,6 @@ mod tests {
             storage_class: ObjectStorageClass::Standard,
             encryption_context: None,
         };
-        assert_eq!(metadata.bucket, "my-bucket");
         assert!(metadata.is_latest);
     }
 
@@ -195,5 +264,13 @@ mod tests {
         let rendered = format!("{err}");
         assert!(rendered.contains("invalid page cursor"), "{rendered}");
         assert!(rendered.contains("not valid base64"), "{rendered}");
+    }
+
+    #[test]
+    fn metadata_error_displays_the_bucket_variants() {
+        let exists = MetadataError::BucketAlreadyExists { name: "b".to_string() };
+        assert!(format!("{exists}").contains("bucket already exists: b"), "{exists}");
+        let missing = MetadataError::NoSuchBucket { name: "b".to_string() };
+        assert!(format!("{missing}").contains("no such bucket: b"), "{missing}");
     }
 }

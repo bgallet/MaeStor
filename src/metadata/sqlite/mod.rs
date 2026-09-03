@@ -8,8 +8,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ListPage, ListParams,
-    Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
+    Bucket, BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag,
+    KnownContentType, ListPage, ListParams, Metadata, MetadataError, MetadataStore,
+    ObjectStorageClass, ObjectVersion,
 };
 
 pub struct SqliteMetadataStore {
@@ -192,6 +193,90 @@ impl SqliteMetadataStore {
             }
         }
     }
+
+    /// Runs a single-column `UPDATE buckets SET <col> = ?, modified_at = ?
+    /// WHERE name = ?`, binding `value` for the column, and maps a missing row
+    /// to `NoSuchBucket`. `sql` is always a caller-side static literal.
+    async fn update_bucket_column<'q, T>(
+        &self,
+        name: &'q str,
+        sql: &'q str,
+        value: T,
+    ) -> Result<(), MetadataError>
+    where
+        T: sqlx::Type<sqlx::Sqlite> + sqlx::Encode<'q, sqlx::Sqlite> + Send + 'q,
+    {
+        let modified = system_time_to_millis(SystemTime::now(), "modified_at")?;
+        let affected = sqlx::query(sql)
+            .bind(value)
+            .bind(modified)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?
+            .rows_affected();
+        if affected == 0 {
+            return Err(MetadataError::NoSuchBucket { name: name.to_string() });
+        }
+        Ok(())
+    }
+
+    /// Demotes the current latest row for `(bucket_name, metadata.key)` and
+    /// upserts `metadata` as the new latest, in one transaction. If the upsert
+    /// targets a row that the demote just cleared (the unversioned-overwrite
+    /// case), `ON CONFLICT` re-marks it latest from `metadata.is_latest`, which
+    /// is the caller's to set.
+    async fn insert_row_as_latest(
+        &self,
+        bucket_name: &str,
+        metadata: &Metadata,
+    ) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
+
+        sqlx::query(
+            "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
+        )
+        .bind(bucket_name)
+        .bind(&metadata.key)
+        .execute(&mut *tx)
+        .await
+        .map_err(MetadataError::Backend)?;
+
+        upsert_row(&mut *tx, bucket_name, metadata).await?;
+
+        tx.commit().await.map_err(MetadataError::Backend)
+    }
+
+    /// Writes a delete marker for `(bucket_name, key)` at `version` as the new
+    /// latest row, demoting whatever row currently holds that flag.
+    async fn insert_delete_marker(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        version: ObjectVersion,
+    ) -> Result<(), MetadataError> {
+        let marker = Metadata {
+            etag: Etag(Bytes::new()),
+            last_modified: SystemTime::now(),
+            size: 0,
+            cache_control: CacheControl(String::new()),
+            backend_id: 0,
+            key: key.to_string(),
+            content_type: None,
+            content_disposition: None,
+            content_language: None,
+            version,
+            cloned_at: None,
+            upload_id: None,
+            is_latest: true,
+            delete_marker: true,
+            user_metadata: HashMap::new(),
+            storage_class: ObjectStorageClass::Standard,
+            encryption_context: None,
+        };
+
+        self.insert_row_as_latest(bucket_name, &marker).await
+    }
 }
 
 /// Builds the `list_batch` query string for a given batch shape, with `?`
@@ -233,6 +318,20 @@ fn system_time_to_millis(time: SystemTime, field: &'static str) -> Result<i64, M
 
 fn millis_to_system_time(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis as u64)
+}
+
+/// A fresh, time-sortable object version id (UUIDv7). Used for
+/// store-generated delete-marker ids; the 48-bit millisecond prefix makes
+/// successive ids sort in creation order by the `version` column alone.
+///
+/// That ordering guarantee is per-process only: `uuid::Uuid::now_v7()` orders
+/// ids minted within one process, but two markers created in the same
+/// millisecond by different processes have no defined relative order, and the
+/// prefix only orders at millisecond granularity in any case. `list_versions`
+/// does not depend on it — it currently orders rows (markers included) by rowid
+/// (`id`), not by the `version` column.
+fn new_version_id() -> ObjectVersion {
+    ObjectVersion(uuid::Uuid::now_v7().to_string())
 }
 
 /// Encodes a content type for the `content_type` BLOB column: a known type is
@@ -422,7 +521,6 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
         size,
         cache_control: CacheControl(row.try_get("cache_control").map_err(MetadataError::Backend)?),
         backend_id,
-        bucket: row.try_get("bucket").map_err(MetadataError::Backend)?,
         key: row.try_get("key").map_err(MetadataError::Backend)?,
         content_type: row
             .try_get::<Option<Vec<u8>>, _>("content_type")
@@ -455,7 +553,42 @@ fn row_to_metadata(row: &SqliteRow) -> Result<Metadata, MetadataError> {
     })
 }
 
-async fn upsert_row<'e, E>(executor: E, metadata: &Metadata) -> Result<(), MetadataError>
+fn row_to_bucket(row: &SqliteRow) -> Result<Bucket, MetadataError> {
+    let versioning_text: String = row.try_get("versioning").map_err(MetadataError::Backend)?;
+    let versioning =
+        BucketVersioning::parse(&versioning_text).ok_or_else(|| MetadataError::Corrupt {
+            field: "versioning",
+            detail: format!("unrecognized bucket versioning state {versioning_text:?}"),
+        })?;
+
+    let blob = |name: &str| -> Result<Option<Bytes>, MetadataError> {
+        Ok(row
+            .try_get::<Option<Vec<u8>>, _>(name)
+            .map_err(MetadataError::Backend)?
+            .map(Bytes::from))
+    };
+
+    Ok(Bucket {
+        name: row.try_get("name").map_err(MetadataError::Backend)?,
+        owner: row.try_get("owner").map_err(MetadataError::Backend)?,
+        created_at: millis_to_system_time(
+            row.try_get("created_at").map_err(MetadataError::Backend)?,
+        ),
+        modified_at: millis_to_system_time(
+            row.try_get("modified_at").map_err(MetadataError::Backend)?,
+        ),
+        versioning,
+        acl: blob("acl")?,
+        cors: blob("cors")?,
+        lifecycle: blob("lifecycle")?,
+    })
+}
+
+async fn upsert_row<'e, E>(
+    executor: E,
+    bucket_name: &str,
+    metadata: &Metadata,
+) -> Result<(), MetadataError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -500,7 +633,7 @@ where
             storage_class = excluded.storage_class,
             encryption_context = excluded.encryption_context",
     )
-    .bind(&metadata.bucket)
+    .bind(bucket_name)
     .bind(&metadata.key)
     .bind(&metadata.version.0)
     .bind(metadata.etag.0.to_vec())
@@ -527,54 +660,9 @@ where
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
-    async fn put_versioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.is_latest = true;
-
-        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
-
-        sqlx::query(
-            "UPDATE object_metadata SET is_latest = 0 WHERE bucket = ? AND key = ? AND is_latest = 1",
-        )
-        .bind(&metadata.bucket)
-        .bind(&metadata.key)
-        .execute(&mut *tx)
-        .await
-        .map_err(MetadataError::Backend)?;
-
-        upsert_row(&mut *tx, &metadata).await?;
-
-        tx.commit().await.map_err(MetadataError::Backend)
-    }
-
-    async fn put_unversioned(&self, mut metadata: Metadata) -> Result<(), MetadataError> {
-        metadata.version = ObjectVersion::unversioned();
-        metadata.is_latest = true;
-
-        let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
-
-        // Versioned rows may already exist for this key (a bucket whose
-        // versioning was suspended). Demote whichever of them is currently
-        // latest — but never the sentinel row itself, since the upsert below
-        // re-marks it latest anyway.
-        sqlx::query(
-            "UPDATE object_metadata SET is_latest = 0
-             WHERE bucket = ? AND key = ? AND is_latest = 1 AND version <> ?",
-        )
-        .bind(&metadata.bucket)
-        .bind(&metadata.key)
-        .bind(&metadata.version.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(MetadataError::Backend)?;
-
-        upsert_row(&mut *tx, &metadata).await?;
-
-        tx.commit().await.map_err(MetadataError::Backend)
-    }
-
     async fn get(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         key: &str,
         version: Option<&ObjectVersion>,
     ) -> Result<Option<Metadata>, MetadataError> {
@@ -583,7 +671,7 @@ impl MetadataStore for SqliteMetadataStore {
                 sqlx::query(
                     "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?",
                 )
-                .bind(bucket)
+                .bind(&bucket.name)
                 .bind(key)
                 .bind(&version.0)
                 .fetch_optional(&self.pool)
@@ -593,7 +681,7 @@ impl MetadataStore for SqliteMetadataStore {
                 sqlx::query(
                     "SELECT * FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1",
                 )
-                .bind(bucket)
+                .bind(&bucket.name)
                 .bind(key)
                 .fetch_optional(&self.pool)
                 .await
@@ -604,46 +692,54 @@ impl MetadataStore for SqliteMetadataStore {
         row.map(|row| row_to_metadata(&row)).transpose()
     }
 
-    async fn delete_versioned(
-        &self,
-        bucket: &str,
-        key: &str,
-        new_version: ObjectVersion,
-    ) -> Result<(), MetadataError> {
-        let marker = Metadata {
-            etag: Etag(Bytes::new()),
-            last_modified: SystemTime::now(),
-            size: 0,
-            cache_control: CacheControl(String::new()),
-            backend_id: 0,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            content_type: None,
-            content_disposition: None,
-            content_language: None,
-            version: new_version,
-            cloned_at: None,
-            upload_id: None,
-            is_latest: true,
-            delete_marker: true,
-            user_metadata: HashMap::new(),
-            storage_class: ObjectStorageClass::Standard,
-            encryption_context: None,
-        };
-
-        self.put_versioned(marker).await
+    async fn put(&self, bucket: &Bucket, mut metadata: Metadata) -> Result<(), MetadataError> {
+        metadata.is_latest = true;
+        if bucket.versioning != BucketVersioning::Enabled {
+            // Suspended and unversioned buckets write to the sentinel version;
+            // any pre-existing versioned rows for this key are demoted, not
+            // removed.
+            metadata.version = ObjectVersion::unversioned();
+        }
+        self.insert_row_as_latest(&bucket.name, &metadata).await
     }
 
-    async fn delete_specific_version(
+    async fn delete(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
+        key: &str,
+    ) -> Result<Option<ObjectVersion>, MetadataError> {
+        // Enabled and Suspended both write a delete marker as the new latest,
+        // differing only in its version id; Unversioned hard-removes the row.
+        let marker = match bucket.versioning {
+            BucketVersioning::Enabled => new_version_id(),
+            BucketVersioning::Suspended => ObjectVersion::unversioned(),
+            BucketVersioning::Unversioned => {
+                sqlx::query(
+                    "DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?",
+                )
+                .bind(&bucket.name)
+                .bind(key)
+                .bind(&ObjectVersion::unversioned().0)
+                .execute(&self.pool)
+                .await
+                .map_err(MetadataError::Backend)?;
+                return Ok(None);
+            }
+        };
+        self.insert_delete_marker(&bucket.name, key, marker.clone()).await?;
+        Ok(Some(marker))
+    }
+
+    async fn delete_version(
+        &self,
+        bucket: &Bucket,
         key: &str,
         version: &ObjectVersion,
     ) -> Result<(), MetadataError> {
         let mut tx = self.pool.begin().await.map_err(MetadataError::Backend)?;
 
         sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
-            .bind(bucket)
+            .bind(&bucket.name)
             .bind(key)
             .bind(&version.0)
             .execute(&mut *tx)
@@ -662,9 +758,9 @@ impl MetadataStore for SqliteMetadataStore {
                  SELECT 1 FROM object_metadata WHERE bucket = ? AND key = ? AND is_latest = 1
              )",
         )
-        .bind(bucket)
+        .bind(&bucket.name)
         .bind(key)
-        .bind(bucket)
+        .bind(&bucket.name)
         .bind(key)
         .execute(&mut *tx)
         .await
@@ -673,42 +769,125 @@ impl MetadataStore for SqliteMetadataStore {
         tx.commit().await.map_err(MetadataError::Backend)
     }
 
-    async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
-        sqlx::query("DELETE FROM object_metadata WHERE bucket = ? AND key = ? AND version = ?")
-            .bind(bucket)
-            .bind(key)
-            .bind(&ObjectVersion::unversioned().0)
-            .execute(&self.pool)
-            .await
-            .map_err(MetadataError::Backend)?;
-
-        Ok(())
-    }
-
     async fn list(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError> {
-        self.list_page(bucket, params, true).await
+        self.list_page(&bucket.name, params, true).await
     }
 
     async fn list_versions(
         &self,
-        bucket: &str,
+        bucket: &Bucket,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError> {
-        self.list_page(bucket, params, false).await
+        self.list_page(&bucket.name, params, false).await
     }
 
-    async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT DISTINCT bucket FROM object_metadata ORDER BY bucket")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(MetadataError::Backend)?;
+    async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError> {
+        let rows = sqlx::query("SELECT * FROM buckets WHERE owner = ? ORDER BY name")
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        rows.iter().map(row_to_bucket).collect()
+    }
 
-        Ok(rows.into_iter().map(|(bucket,)| bucket).collect())
+    async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError> {
+        let now_millis = system_time_to_millis(SystemTime::now(), "created_at")?;
+        let versioning = BucketVersioning::default();
+
+        let result = sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(owner)
+        .bind(now_millis)
+        .bind(now_millis)
+        .bind(versioning.as_str())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(Bucket {
+                name: name.to_string(),
+                owner: owner.to_string(),
+                created_at: millis_to_system_time(now_millis),
+                modified_at: millis_to_system_time(now_millis),
+                versioning,
+                acl: None,
+                cors: None,
+                lifecycle: None,
+            }),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(MetadataError::BucketAlreadyExists { name: name.to_string() })
+            }
+            Err(err) => Err(MetadataError::Backend(err)),
+        }
+    }
+
+    async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError> {
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        row.map(|row| row_to_bucket(&row)).transpose()
+    }
+
+    async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        sqlx::query("DELETE FROM buckets WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        Ok(())
+    }
+
+    async fn set_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioning,
+    ) -> Result<(), MetadataError> {
+        self.update_bucket_column(
+            name,
+            "UPDATE buckets SET versioning = ?, modified_at = ? WHERE name = ?",
+            state.as_str(),
+        )
+        .await
+    }
+
+    async fn set_bucket_acl(&self, name: &str, acl: Option<Bytes>) -> Result<(), MetadataError> {
+        self.update_bucket_column(
+            name,
+            "UPDATE buckets SET acl = ?, modified_at = ? WHERE name = ?",
+            acl.map(|b| b.to_vec()),
+        )
+        .await
+    }
+
+    async fn set_bucket_cors(&self, name: &str, cors: Option<Bytes>) -> Result<(), MetadataError> {
+        self.update_bucket_column(
+            name,
+            "UPDATE buckets SET cors = ?, modified_at = ? WHERE name = ?",
+            cors.map(|b| b.to_vec()),
+        )
+        .await
+    }
+
+    async fn set_bucket_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: Option<Bytes>,
+    ) -> Result<(), MetadataError> {
+        self.update_bucket_column(
+            name,
+            "UPDATE buckets SET lifecycle = ?, modified_at = ? WHERE name = ?",
+            lifecycle.map(|b| b.to_vec()),
+        )
+        .await
     }
 }
 
@@ -716,6 +895,7 @@ impl MetadataStore for SqliteMetadataStore {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::metadata::conformance::sample_metadata;
 
     // The behavioral contract is exercised once, through the trait, by the
     // shared conformance suite. Only tests that need SQLite internals — the
@@ -777,7 +957,6 @@ mod tests {
 
         let metadata = row_to_metadata(&row).expect("row should decode");
 
-        assert_eq!(metadata.bucket, "my-bucket");
         assert_eq!(metadata.key, "my-key");
         assert_eq!(metadata.version, ObjectVersion("v1".to_string()));
         assert_eq!(metadata.etag, Etag(Bytes::from_static(b"\"abc123\"")));
@@ -962,6 +1141,26 @@ mod tests {
     }
 
     #[test]
+    fn new_version_id_is_a_distinct_uuid_each_call() {
+        let a = new_version_id();
+        let b = new_version_id();
+        assert_ne!(a, b);
+        // UUID string form: 36 chars, and the version nibble (char 14) is '7'.
+        assert_eq!(a.0.len(), 36, "{}", a.0);
+        assert_eq!(a.0.as_bytes()[14], b'7', "expected a v7 UUID: {}", a.0);
+    }
+
+    #[test]
+    fn new_version_id_is_time_sortable() {
+        // v7 embeds a millisecond timestamp prefix, so a later id sorts after
+        // an earlier one lexicographically. A tiny sleep guarantees a tick.
+        let a = new_version_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = new_version_id();
+        assert!(a.0 < b.0, "{} should sort before {}", a.0, b.0);
+    }
+
+    #[test]
     fn encode_content_type_rejects_an_other_too_short_to_disambiguate() {
         let err = encode_content_type(&ContentType::Other("x".to_string()))
             .expect_err("a one-byte Other should be rejected");
@@ -1035,5 +1234,154 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn connect_in_memory_creates_the_buckets_table_and_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let names: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master
+             WHERE name IN ('buckets', 'idx_buckets_owner_name') ORDER BY name",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .expect("query should succeed");
+        let names: Vec<String> = names.into_iter().map(|(n,)| n).collect();
+        assert_eq!(names, vec!["buckets".to_string(), "idx_buckets_owner_name".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn row_to_bucket_decodes_all_columns() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning, acl, cors, lifecycle)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("b")
+        .bind("o")
+        .bind(1_700_000_000_000i64)
+        .bind(1_700_000_009_000i64)
+        .bind("ENABLED")
+        .bind(Some(vec![1u8, 2, 3]))
+        .bind(Option::<Vec<u8>>::None)
+        .bind(Some(b"<lc/>".to_vec()))
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = 'b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+        let bucket = row_to_bucket(&row).expect("row should decode");
+
+        assert_eq!(bucket.name, "b");
+        assert_eq!(bucket.owner, "o");
+        assert_eq!(bucket.created_at, millis_to_system_time(1_700_000_000_000));
+        assert_eq!(bucket.modified_at, millis_to_system_time(1_700_000_009_000));
+        assert_eq!(bucket.versioning, BucketVersioning::Enabled);
+        assert_eq!(bucket.acl.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(bucket.cors, None);
+        assert_eq!(bucket.lifecycle.as_deref(), Some(&b"<lc/>"[..]));
+    }
+
+    #[tokio::test]
+    async fn row_to_bucket_rejects_an_unrecognized_versioning_string() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES ('b', 'o', 0, 0, 'WAT')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = 'b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+        let err = row_to_bucket(&row).expect_err("a bogus versioning value should not decode");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "versioning", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_buckets_query_plan_uses_the_owner_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let plan = query_plan(
+            &store,
+            "SELECT * FROM buckets WHERE owner = 'x' ORDER BY name",
+        )
+        .await;
+        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
+        assert!(
+            plan.contains("USING INDEX idx_buckets_owner_name"),
+            "expected the owner index, got:\n{plan}",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_timestamp_round_trips() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let created = store.create_bucket("b", "o").await.expect("create should succeed");
+        let fetched = store.get_bucket("b").await.expect("get").expect("exists");
+        assert_eq!(created.created_at, fetched.created_at);
+        assert_eq!(created.modified_at, fetched.modified_at);
+    }
+
+    // Pins the `modified_at = ?` bump in every setter's `UPDATE`: a bucket
+    // planted with `modified_at = 0` must read back with a fresh (post-epoch)
+    // `modified_at` after each setter runs. `set_bucket_cors` also covers the
+    // shared `set_bucket_blob` path.
+    #[tokio::test]
+    async fn set_bucket_setters_bump_modified_at() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES ('b', 'o', 0, 0, 'UNVERSIONED')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        store
+            .set_bucket_versioning("b", BucketVersioning::Enabled)
+            .await
+            .expect("set_bucket_versioning should succeed");
+        let after_versioning = store.get_bucket("b").await.expect("get").expect("exists");
+        assert!(
+            after_versioning.modified_at > millis_to_system_time(0),
+            "set_bucket_versioning did not bump modified_at: {:?}",
+            after_versioning.modified_at,
+        );
+
+        store
+            .set_bucket_cors("b", Some(Bytes::from_static(b"<c/>")))
+            .await
+            .expect("set_bucket_cors should succeed");
+        let after_cors = store.get_bucket("b").await.expect("get").expect("exists");
+        assert!(
+            after_cors.modified_at > millis_to_system_time(0),
+            "set_bucket_cors did not bump modified_at: {:?}",
+            after_cors.modified_at,
+        );
+    }
+
+    #[tokio::test]
+    async fn successive_delete_markers_get_ascending_version_ids() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        store.create_bucket("b", "o").await.expect("create");
+        store.set_bucket_versioning("b", BucketVersioning::Enabled).await.expect("enable");
+        let bucket = store.get_bucket("b").await.expect("get").expect("exists");
+
+        store.put(&bucket, sample_metadata("k", "v1")).await.expect("put");
+        let m1 = store.delete(&bucket, "k").await.expect("d1").expect("marker");
+        store.put(&bucket, sample_metadata("k", "v2")).await.expect("put");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let m2 = store.delete(&bucket, "k").await.expect("d2").expect("marker");
+
+        assert!(m1.0 < m2.0, "{} should sort before {}", m1.0, m2.0);
     }
 }
