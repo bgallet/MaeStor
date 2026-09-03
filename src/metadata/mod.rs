@@ -146,6 +146,23 @@ pub trait MetadataStore: Send + Sync {
         version: &ObjectVersion,
     ) -> Result<(), MetadataError>;
     async fn delete_unversioned(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
+
+    /// The S3 object write. Branches on `bucket.versioning`: an `Enabled`
+    /// bucket inserts a new version at `metadata.version`; a `Suspended` or
+    /// `Unversioned` bucket overwrites the `"null"` version.
+    async fn put(&self, bucket: &Bucket, metadata: Metadata) -> Result<(), MetadataError>;
+
+    /// The S3 `DELETE` with no version id. `Enabled`: inserts a delete marker
+    /// with a store-generated id (returned). `Suspended`: a delete marker at
+    /// version `"null"` (returns that). `Unversioned`: hard-removes the
+    /// `"null"` row (returns `None`).
+    async fn delete(&self, bucket: &Bucket, key: &str) -> Result<Option<ObjectVersion>, MetadataError>;
+
+    /// The S3 `DELETE` with a client-named version id — removes exactly that
+    /// row and promotes the next-most-recent remaining row to latest if the
+    /// removed one held that flag.
+    async fn delete_version(&self, bucket: &Bucket, key: &str, version: &ObjectVersion) -> Result<(), MetadataError>;
+
     async fn list(
         &self,
         bucket: &str,

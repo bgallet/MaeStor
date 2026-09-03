@@ -263,7 +263,6 @@ fn millis_to_system_time(millis: i64) -> SystemTime {
 /// A fresh, time-sortable object version id (UUIDv7). Used for
 /// store-generated delete-marker ids; the 48-bit millisecond prefix makes
 /// successive ids sort in creation order by the `version` column alone.
-#[allow(dead_code)] // gains a caller in the next task
 fn new_version_id() -> ObjectVersion {
     ObjectVersion(uuid::Uuid::now_v7().to_string())
 }
@@ -747,6 +746,48 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(MetadataError::Backend)?;
 
         Ok(())
+    }
+
+    async fn put(&self, bucket: &Bucket, mut metadata: Metadata) -> Result<(), MetadataError> {
+        metadata.bucket = bucket.name.clone();
+        match bucket.versioning {
+            BucketVersioning::Enabled => self.put_versioned(metadata).await,
+            BucketVersioning::Suspended | BucketVersioning::Unversioned => {
+                self.put_unversioned(metadata).await
+            }
+        }
+    }
+
+    async fn delete(
+        &self,
+        bucket: &Bucket,
+        key: &str,
+    ) -> Result<Option<ObjectVersion>, MetadataError> {
+        match bucket.versioning {
+            BucketVersioning::Enabled => {
+                let marker = new_version_id();
+                self.delete_versioned(&bucket.name, key, marker.clone()).await?;
+                Ok(Some(marker))
+            }
+            BucketVersioning::Suspended => {
+                let null = ObjectVersion::unversioned();
+                self.delete_versioned(&bucket.name, key, null.clone()).await?;
+                Ok(Some(null))
+            }
+            BucketVersioning::Unversioned => {
+                self.delete_unversioned(&bucket.name, key).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn delete_version(
+        &self,
+        bucket: &Bucket,
+        key: &str,
+        version: &ObjectVersion,
+    ) -> Result<(), MetadataError> {
+        self.delete_specific_version(&bucket.name, key, version).await
     }
 
     async fn list(
