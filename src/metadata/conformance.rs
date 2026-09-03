@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use crate::metadata::{
-    BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag, ListPage, ListParams,
-    Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
+    Bucket, BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag, ListPage,
+    ListParams, Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
 };
 
 /// A metadata record with every optional field left empty, for tests that only
@@ -52,6 +52,32 @@ pub(crate) fn sample_metadata(bucket: &str, key: &str, version: &str) -> Metadat
         storage_class: ObjectStorageClass::Standard,
         encryption_context: None,
     }
+}
+
+const OBJECT_OWNER: &str = "object-owner";
+
+/// Creates a bucket in `versioning` state and returns the stored row.
+async fn fresh_bucket(
+    store: &impl MetadataStore,
+    name: &str,
+    versioning: BucketVersioning,
+) -> Bucket {
+    let bucket = store
+        .create_bucket(name, OBJECT_OWNER)
+        .await
+        .expect("create_bucket should succeed");
+    if versioning == BucketVersioning::Unversioned {
+        return bucket;
+    }
+    store
+        .set_bucket_versioning(name, versioning)
+        .await
+        .expect("set_bucket_versioning should succeed");
+    store
+        .get_bucket(name)
+        .await
+        .expect("get_bucket should succeed")
+        .expect("the bucket exists")
 }
 
 /// Drains every page of a list operation into flat vectors. Requires
@@ -106,19 +132,20 @@ async fn versions_for_key(store: &impl MetadataStore, bucket: &str, key: &str) -
 pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("first put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("second put should succeed");
 
     assert_eq!(versions_for_key(&store, "b", "k").await.len(), 2);
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a latest row should exist");
@@ -126,7 +153,7 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
     assert!(latest.is_latest);
 
     let previous = store
-        .get("b", "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("v1 should still exist");
@@ -134,24 +161,25 @@ pub(crate) async fn put_versioned_inserts_a_new_latest_and_demotes_the_old_one(
 }
 
 pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let mut first = sample_metadata("b", "k", "ignored");
     first.size = 10;
     store
-        .put_unversioned(first)
+        .put(&bucket, first)
         .await
         .expect("first put should succeed");
 
     let mut second = sample_metadata("b", "k", "also-ignored");
     second.size = 20;
     store
-        .put_unversioned(second)
+        .put(&bucket, second)
         .await
         .expect("second put should succeed");
 
     assert_eq!(versions_for_key(&store, "b", "k").await.len(), 1);
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -161,17 +189,18 @@ pub(crate) async fn put_unversioned_upserts_a_single_row(store: impl MetadataSto
 }
 
 pub(crate) async fn get_with_no_version_returns_the_latest_row(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("put should succeed");
 
     let found = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -181,17 +210,18 @@ pub(crate) async fn get_with_no_version_returns_the_latest_row(store: impl Metad
 pub(crate) async fn get_with_a_specific_version_returns_that_version_even_if_not_latest(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("put should succeed");
 
     let found = store
-        .get("b", "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -200,34 +230,46 @@ pub(crate) async fn get_with_a_specific_version_returns_that_version_even_if_not
 }
 
 pub(crate) async fn get_returns_none_for_a_key_that_was_never_written(store: impl MetadataStore) {
+    let bucket = Bucket {
+        name: "no-such-bucket".to_string(),
+        owner: OBJECT_OWNER.to_string(),
+        created_at: SystemTime::now(),
+        modified_at: SystemTime::now(),
+        versioning: BucketVersioning::Unversioned,
+        acl: None,
+        cors: None,
+        lifecycle: None,
+    };
     let found = store
-        .get("no-such-bucket", "no-such-key", None)
+        .get(&bucket.name, "no-such-key", None)
         .await
         .expect("get should succeed");
     assert_eq!(found, None);
 }
 
 pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
 
-    store
-        .delete_versioned("b", "k", ObjectVersion("marker1".to_string()))
+    let marker = store
+        .delete(&bucket, "k")
         .await
-        .expect("delete_versioned should succeed");
+        .expect("delete should succeed")
+        .expect("an enabled bucket returns a marker");
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
-    assert_eq!(latest.version, ObjectVersion("marker1".to_string()));
+    assert_eq!(latest.version, marker);
     assert!(latest.delete_marker);
 
     let original = store
-        .get("b", "k", Some(&ObjectVersion("v1".to_string())))
+        .get(&bucket.name, "k", Some(&ObjectVersion("v1".to_string())))
         .await
         .expect("get should succeed")
         .expect("original version should still exist");
@@ -235,23 +277,24 @@ pub(crate) async fn delete_versioned_creates_a_marker_as_the_new_latest(store: i
 }
 
 pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("put should succeed");
 
     store
-        .delete_specific_version("b", "k", &ObjectVersion("v1".to_string()))
+        .delete_version(&bucket, "k", &ObjectVersion("v1".to_string()))
         .await
         .expect("delete should succeed");
 
     assert_eq!(versions_for_key(&store, "b", "k").await.len(), 1);
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -261,22 +304,23 @@ pub(crate) async fn delete_specific_version_removes_only_that_row(store: impl Me
 pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_latest_is_removed(
     store: impl MetadataStore,
 ) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
     store
-        .put_versioned(sample_metadata("b", "k", "v2"))
+        .put(&bucket, sample_metadata("b", "k", "v2"))
         .await
         .expect("put should succeed");
 
     store
-        .delete_specific_version("b", "k", &ObjectVersion("v2".to_string()))
+        .delete_version(&bucket, "k", &ObjectVersion("v2".to_string()))
         .await
         .expect("delete should succeed");
 
     let latest = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("v1 should have been promoted to latest");
@@ -285,17 +329,22 @@ pub(crate) async fn delete_specific_version_promotes_the_next_latest_when_the_la
 }
 
 pub(crate) async fn delete_unversioned_removes_the_sentinel_row(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put_unversioned(sample_metadata("b", "k", "ignored"))
+        .put(&bucket, sample_metadata("b", "k", "ignored"))
         .await
         .expect("put should succeed");
 
-    store
-        .delete_unversioned("b", "k")
+    let marker = store
+        .delete(&bucket, "k")
         .await
         .expect("delete should succeed");
+    assert_eq!(marker, None);
 
-    let found = store.get("b", "k", None).await.expect("get should succeed");
+    let found = store
+        .get(&bucket.name, "k", None)
+        .await
+        .expect("get should succeed");
     assert_eq!(found, None);
 }
 
@@ -635,16 +684,16 @@ pub(crate) async fn delete_bucket_removes_the_row_and_is_idempotent(store: impl 
 }
 
 pub(crate) async fn delete_bucket_leaves_its_objects_untouched(store: impl MetadataStore) {
-    store.create_bucket("b", BUCKET_OWNER).await.expect("create should succeed");
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     store
-        .put_versioned(sample_metadata("b", "k", "v1"))
+        .put(&bucket, sample_metadata("b", "k", "v1"))
         .await
         .expect("put should succeed");
 
     store.delete_bucket("b").await.expect("delete_bucket should succeed");
 
     let object = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed");
     assert!(object.is_some(), "the object should survive its bucket's deletion");
@@ -712,8 +761,18 @@ pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl Metad
 
 pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl MetadataStore) {
     // An object whose bucket has no `buckets` row.
+    let ghost = Bucket {
+        name: "ghost-bucket".to_string(),
+        owner: OBJECT_OWNER.to_string(),
+        created_at: SystemTime::now(),
+        modified_at: SystemTime::now(),
+        versioning: BucketVersioning::Enabled,
+        acl: None,
+        cors: None,
+        lifecycle: None,
+    };
     store
-        .put_versioned(sample_metadata("ghost-bucket", "k", "v1"))
+        .put(&ghost, sample_metadata("ghost-bucket", "k", "v1"))
         .await
         .expect("put should succeed");
     store.create_bucket("real", BUCKET_OWNER).await.expect("create should succeed");
@@ -777,11 +836,12 @@ pub(crate) async fn repeated_put_unversioned_keeps_the_sentinel_row_latest(
 }
 
 pub(crate) async fn put_rejects_a_pre_epoch_last_modified(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let mut metadata = sample_metadata("b", "k", "v1");
     metadata.last_modified = UNIX_EPOCH - Duration::from_secs(60);
 
     let err = store
-        .put_versioned(metadata)
+        .put(&bucket, metadata)
         .await
         .expect_err("a pre-epoch timestamp should be rejected");
     assert!(
@@ -797,11 +857,12 @@ pub(crate) async fn put_rejects_a_pre_epoch_last_modified(store: impl MetadataSt
 }
 
 pub(crate) async fn put_rejects_a_pre_epoch_cloned_at(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Unversioned).await;
     let mut metadata = sample_metadata("b", "k", "v1");
     metadata.cloned_at = Some(UNIX_EPOCH - Duration::from_secs(60));
 
     let err = store
-        .put_versioned(metadata)
+        .put(&bucket, metadata)
         .await
         .expect_err("a pre-epoch timestamp should be rejected");
     assert!(
@@ -817,6 +878,7 @@ pub(crate) async fn put_rejects_a_pre_epoch_cloned_at(store: impl MetadataStore)
 }
 
 pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     let expected = Metadata {
         etag: Etag(Bytes::from_static(b"\"round-trip-etag\"")),
         // Exact-millisecond instants so no backend loses precision on them.
@@ -847,12 +909,12 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
     };
 
     store
-        .put_versioned(expected.clone())
+        .put(&bucket, expected.clone())
         .await
         .expect("put should succeed");
 
     let found = store
-        .get("b", "deep/key/name", None)
+        .get(&bucket.name, "deep/key/name", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
@@ -860,16 +922,17 @@ pub(crate) async fn all_fields_round_trip(store: impl MetadataStore) {
 }
 
 pub(crate) async fn an_unknown_content_type_round_trips_verbatim(store: impl MetadataStore) {
+    let bucket = fresh_bucket(&store, "b", BucketVersioning::Enabled).await;
     let mut metadata = sample_metadata("b", "k", "v1");
     metadata.content_type = Some(ContentType::Other("application/vnd.acme+special".to_string()));
 
     store
-        .put_versioned(metadata.clone())
+        .put(&bucket, metadata.clone())
         .await
         .expect("put should succeed");
 
     let found = store
-        .get("b", "k", None)
+        .get(&bucket.name, "k", None)
         .await
         .expect("get should succeed")
         .expect("a row should be found");
