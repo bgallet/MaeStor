@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use crate::metadata::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, ListPage, ListParams, Metadata,
-    MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
+    BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag, ListPage, ListParams,
+    Metadata, MetadataError, MetadataStore, ObjectStorageClass, ObjectVersion,
 };
 
 /// A metadata record with every optional field left empty, for tests that only
@@ -587,6 +587,137 @@ pub(crate) async fn list_buckets_is_scoped_to_owner_and_sorted(store: impl Metad
     assert!(none.is_empty());
 }
 
+const BUCKET_OWNER: &str = "owner-1";
+
+pub(crate) async fn create_bucket_then_get_returns_the_row(store: impl MetadataStore) {
+    let created = store
+        .create_bucket("b", BUCKET_OWNER)
+        .await
+        .expect("create_bucket should succeed");
+    assert_eq!(created.name, "b");
+    assert_eq!(created.owner, BUCKET_OWNER);
+    assert_eq!(created.versioning, BucketVersioning::Unversioned);
+    assert_eq!(created.acl, None);
+    assert_eq!(created.cors, None);
+    assert_eq!(created.lifecycle, None);
+    assert_eq!(created.created_at, created.modified_at);
+
+    let fetched = store
+        .get_bucket("b")
+        .await
+        .expect("get_bucket should succeed")
+        .expect("bucket should exist");
+    assert_eq!(fetched, created);
+}
+
+pub(crate) async fn create_bucket_rejects_a_duplicate_name(store: impl MetadataStore) {
+    store.create_bucket("b", BUCKET_OWNER).await.expect("first create should succeed");
+    let err = store
+        .create_bucket("b", "a-different-owner")
+        .await
+        .expect_err("a taken name should be rejected regardless of owner");
+    assert!(
+        matches!(err, MetadataError::BucketAlreadyExists { ref name } if name == "b"),
+        "unexpected error: {err:?}"
+    );
+}
+
+pub(crate) async fn get_bucket_returns_none_for_a_missing_bucket(store: impl MetadataStore) {
+    let found = store.get_bucket("no-such-bucket").await.expect("get_bucket should succeed");
+    assert_eq!(found, None);
+}
+
+pub(crate) async fn delete_bucket_removes_the_row_and_is_idempotent(store: impl MetadataStore) {
+    store.create_bucket("b", BUCKET_OWNER).await.expect("create should succeed");
+    store.delete_bucket("b").await.expect("first delete should succeed");
+    assert_eq!(store.get_bucket("b").await.expect("get_bucket should succeed"), None);
+    store.delete_bucket("b").await.expect("second delete should also succeed");
+}
+
+pub(crate) async fn delete_bucket_leaves_its_objects_untouched(store: impl MetadataStore) {
+    store.create_bucket("b", BUCKET_OWNER).await.expect("create should succeed");
+    store
+        .put_versioned(sample_metadata("b", "k", "v1"))
+        .await
+        .expect("put should succeed");
+
+    store.delete_bucket("b").await.expect("delete_bucket should succeed");
+
+    let object = store
+        .get("b", "k", None)
+        .await
+        .expect("get should succeed");
+    assert!(object.is_some(), "the object should survive its bucket's deletion");
+}
+
+pub(crate) async fn set_bucket_versioning_updates_state(store: impl MetadataStore) {
+    let created = store.create_bucket("b", BUCKET_OWNER).await.expect("create should succeed");
+    store
+        .set_bucket_versioning("b", BucketVersioning::Enabled)
+        .await
+        .expect("set_bucket_versioning should succeed");
+
+    let updated = store
+        .get_bucket("b")
+        .await
+        .expect("get_bucket should succeed")
+        .expect("bucket should exist");
+    assert_eq!(updated.versioning, BucketVersioning::Enabled);
+    assert!(updated.modified_at >= created.created_at);
+}
+
+pub(crate) async fn set_bucket_config_on_a_missing_bucket_is_an_error(store: impl MetadataStore) {
+    let v = store.set_bucket_versioning("ghost", BucketVersioning::Enabled).await;
+    assert!(matches!(v, Err(MetadataError::NoSuchBucket { .. })), "{v:?}");
+
+    let a = store.set_bucket_acl("ghost", Some(bytes::Bytes::from_static(b"<acl/>"))).await;
+    assert!(matches!(a, Err(MetadataError::NoSuchBucket { .. })), "{a:?}");
+
+    let c = store.set_bucket_cors("ghost", None).await;
+    assert!(matches!(c, Err(MetadataError::NoSuchBucket { .. })), "{c:?}");
+
+    let l = store.set_bucket_lifecycle("ghost", Some(bytes::Bytes::from_static(b"<lc/>"))).await;
+    assert!(matches!(l, Err(MetadataError::NoSuchBucket { .. })), "{l:?}");
+}
+
+pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl MetadataStore) {
+    store.create_bucket("b", BUCKET_OWNER).await.expect("create should succeed");
+
+    let acl = bytes::Bytes::from_static(&[0xff, 0x00, b'a', b'c', b'l']);
+    let cors = bytes::Bytes::from_static(b"<CORSConfiguration/>");
+    let lifecycle = bytes::Bytes::from_static(&[0x00, 0x01, b'l', b'c']);
+    store.set_bucket_acl("b", Some(acl.clone())).await.expect("set acl");
+    store.set_bucket_cors("b", Some(cors.clone())).await.expect("set cors");
+    store.set_bucket_lifecycle("b", Some(lifecycle.clone())).await.expect("set lifecycle");
+
+    let with = store.get_bucket("b").await.expect("get").expect("exists");
+    assert_eq!(with.acl.as_deref(), Some(acl.as_ref()));
+    assert_eq!(with.cors.as_deref(), Some(cors.as_ref()));
+    assert_eq!(with.lifecycle.as_deref(), Some(lifecycle.as_ref()));
+
+    store.set_bucket_acl("b", None).await.expect("clear acl");
+    store.set_bucket_cors("b", None).await.expect("clear cors");
+    store.set_bucket_lifecycle("b", None).await.expect("clear lifecycle");
+
+    let without = store.get_bucket("b").await.expect("get").expect("exists");
+    assert_eq!(without.acl, None);
+    assert_eq!(without.cors, None);
+    assert_eq!(without.lifecycle, None);
+}
+
+pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl MetadataStore) {
+    // An object whose bucket has no `buckets` row.
+    store
+        .put_versioned(sample_metadata("ghost-bucket", "k", "v1"))
+        .await
+        .expect("put should succeed");
+    store.create_bucket("real", BUCKET_OWNER).await.expect("create should succeed");
+
+    let listed = store.list_buckets(BUCKET_OWNER).await.expect("list_buckets should succeed");
+    let names: Vec<_> = listed.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, vec!["real"]);
+}
+
 pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
     store: impl MetadataStore,
 ) {
@@ -815,6 +946,15 @@ macro_rules! metadata_store_conformance {
             case!($make_store, list_rejects_a_malformed_cursor);
             case!($make_store, list_versions_paginates_across_keys_and_versions);
             case!($make_store, list_buckets_is_scoped_to_owner_and_sorted);
+            case!($make_store, create_bucket_then_get_returns_the_row);
+            case!($make_store, create_bucket_rejects_a_duplicate_name);
+            case!($make_store, get_bucket_returns_none_for_a_missing_bucket);
+            case!($make_store, delete_bucket_removes_the_row_and_is_idempotent);
+            case!($make_store, delete_bucket_leaves_its_objects_untouched);
+            case!($make_store, set_bucket_versioning_updates_state);
+            case!($make_store, set_bucket_config_on_a_missing_bucket_is_an_error);
+            case!($make_store, bucket_acl_cors_lifecycle_blobs_round_trip);
+            case!($make_store, list_buckets_reads_only_the_bucket_table);
             case!(
                 $make_store,
                 put_unversioned_demotes_existing_versioned_latest_rows
