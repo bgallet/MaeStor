@@ -68,6 +68,15 @@ async fn fresh_bucket(
     if versioning == BucketVersioning::Unversioned {
         return bucket;
     }
+    set_versioning(store, name, versioning).await
+}
+
+/// Moves an existing bucket to `versioning` and returns the refreshed row.
+async fn set_versioning(
+    store: &impl MetadataStore,
+    name: &str,
+    versioning: BucketVersioning,
+) -> Bucket {
     store
         .set_bucket_versioning(name, versioning)
         .await
@@ -77,6 +86,21 @@ async fn fresh_bucket(
         .await
         .expect("get_bucket should succeed")
         .expect("the bucket exists")
+}
+
+/// A `Bucket` value with no backing `buckets` row, for the object methods that
+/// read only `name` and `versioning` and never require the bucket to exist.
+fn detached_bucket(name: &str, versioning: BucketVersioning) -> Bucket {
+    Bucket {
+        name: name.to_string(),
+        owner: OBJECT_OWNER.to_string(),
+        created_at: SystemTime::now(),
+        modified_at: SystemTime::now(),
+        versioning,
+        acl: None,
+        cors: None,
+        lifecycle: None,
+    }
 }
 
 /// Drains every page of a list operation into flat vectors. Requires
@@ -229,16 +253,7 @@ pub(crate) async fn get_with_a_specific_version_returns_that_version_even_if_not
 }
 
 pub(crate) async fn get_returns_none_for_a_key_that_was_never_written(store: impl MetadataStore) {
-    let bucket = Bucket {
-        name: "no-such-bucket".to_string(),
-        owner: OBJECT_OWNER.to_string(),
-        created_at: SystemTime::now(),
-        modified_at: SystemTime::now(),
-        versioning: BucketVersioning::Unversioned,
-        acl: None,
-        cors: None,
-        lifecycle: None,
-    };
+    let bucket = detached_bucket("no-such-bucket", BucketVersioning::Unversioned);
     let found = store
         .get(&bucket, "no-such-key", None)
         .await
@@ -776,21 +791,8 @@ pub(crate) async fn bucket_acl_cors_lifecycle_blobs_round_trip(store: impl Metad
 pub(crate) async fn list_buckets_reads_only_the_bucket_table(store: impl MetadataStore) {
     // This case isolates one property: `list_buckets` reads only the `buckets`
     // table, never `object_metadata`. The ghost bucket below gets object rows
-    // but no `buckets` row, so it must not appear in the listing. `OBJECT_OWNER`
-    // and `BUCKET_OWNER` are kept as separate constants for readability (object
-    // fixtures vs bucket fixtures); the test does not depend on their values
-    // differing.
-    // An object whose bucket has no `buckets` row.
-    let ghost = Bucket {
-        name: "ghost-bucket".to_string(),
-        owner: OBJECT_OWNER.to_string(),
-        created_at: SystemTime::now(),
-        modified_at: SystemTime::now(),
-        versioning: BucketVersioning::Enabled,
-        acl: None,
-        cors: None,
-        lifecycle: None,
-    };
+    // but no `buckets` row, so it must not appear in the listing.
+    let ghost = detached_bucket("ghost-bucket", BucketVersioning::Enabled);
     store
         .put(&ghost, sample_metadata("k", "v1"))
         .await
@@ -815,11 +817,7 @@ pub(crate) async fn put_on_a_suspended_bucket_demotes_existing_versioned_latest_
         .await
         .expect("put should succeed");
 
-    store
-        .set_bucket_versioning("b", BucketVersioning::Suspended)
-        .await
-        .expect("suspend");
-    let bucket = store.get_bucket("b").await.expect("get").expect("exists");
+    let bucket = set_versioning(&store, "b", BucketVersioning::Suspended).await;
 
     store
         .put(&bucket, sample_metadata("k", "ignored"))
@@ -981,8 +979,7 @@ pub(crate) async fn put_on_a_suspended_bucket_overwrites_null_and_keeps_versione
     store.put(&bucket, sample_metadata("k", "v1")).await.expect("put v1");
     store.put(&bucket, sample_metadata("k", "v2")).await.expect("put v2");
 
-    store.set_bucket_versioning("b", BucketVersioning::Suspended).await.expect("suspend");
-    let bucket = store.get_bucket("b").await.expect("get_bucket").expect("exists");
+    let bucket = set_versioning(&store, "b", BucketVersioning::Suspended).await;
 
     let mut null_put = sample_metadata("k", "ignored");
     null_put.size = 999;
@@ -1041,8 +1038,7 @@ pub(crate) async fn delete_on_a_suspended_bucket_demotes_other_latest_rows_and_k
     store.put(&bucket, sample_metadata("k", "v1")).await.expect("put v1");
     store.put(&bucket, sample_metadata("k", "v2")).await.expect("put v2");
 
-    store.set_bucket_versioning("b", BucketVersioning::Suspended).await.expect("suspend");
-    let bucket = store.get_bucket("b").await.expect("get_bucket").expect("exists");
+    let bucket = set_versioning(&store, "b", BucketVersioning::Suspended).await;
 
     let marker = store
         .delete(&bucket, "k")
