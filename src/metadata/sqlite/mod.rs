@@ -1181,4 +1181,99 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn connect_in_memory_creates_the_buckets_table_and_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let names: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master
+             WHERE name IN ('buckets', 'idx_buckets_owner_name') ORDER BY name",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .expect("query should succeed");
+        let names: Vec<String> = names.into_iter().map(|(n,)| n).collect();
+        assert_eq!(names, vec!["buckets".to_string(), "idx_buckets_owner_name".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn row_to_bucket_decodes_all_columns() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning, acl, cors, lifecycle)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("b")
+        .bind("o")
+        .bind(1_700_000_000_000i64)
+        .bind(1_700_000_009_000i64)
+        .bind("ENABLED")
+        .bind(Some(vec![1u8, 2, 3]))
+        .bind(Option::<Vec<u8>>::None)
+        .bind(Some(b"<lc/>".to_vec()))
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = 'b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+        let bucket = row_to_bucket(&row).expect("row should decode");
+
+        assert_eq!(bucket.name, "b");
+        assert_eq!(bucket.owner, "o");
+        assert_eq!(bucket.created_at, millis_to_system_time(1_700_000_000_000));
+        assert_eq!(bucket.modified_at, millis_to_system_time(1_700_000_009_000));
+        assert_eq!(bucket.versioning, BucketVersioning::Enabled);
+        assert_eq!(bucket.acl.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(bucket.cors, None);
+        assert_eq!(bucket.lifecycle.as_deref(), Some(&b"<lc/>"[..]));
+    }
+
+    #[tokio::test]
+    async fn row_to_bucket_rejects_an_unrecognized_versioning_string() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        sqlx::query(
+            "INSERT INTO buckets (name, owner, created_at, modified_at, versioning)
+             VALUES ('b', 'o', 0, 0, 'WAT')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("insert should succeed");
+
+        let row = sqlx::query("SELECT * FROM buckets WHERE name = 'b'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("row should be found");
+        let err = row_to_bucket(&row).expect_err("a bogus versioning value should not decode");
+        assert!(
+            matches!(err, MetadataError::Corrupt { field: "versioning", .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_buckets_query_plan_uses_the_owner_index() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let plan = query_plan(
+            &store,
+            "SELECT * FROM buckets WHERE owner = 'x' ORDER BY name",
+        )
+        .await;
+        assert!(plan.contains("SEARCH"), "expected an index SEARCH, got:\n{plan}");
+        assert!(
+            plan.contains("USING INDEX idx_buckets_owner_name"),
+            "expected the owner index, got:\n{plan}",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_timestamp_round_trips() {
+        let store = SqliteMetadataStore::connect_in_memory().await;
+        let created = store.create_bucket("b", "o").await.expect("create should succeed");
+        let fetched = store.get_bucket("b").await.expect("get").expect("exists");
+        assert_eq!(created.created_at, fetched.created_at);
+        assert_eq!(created.modified_at, fetched.modified_at);
+    }
 }
