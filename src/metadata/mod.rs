@@ -156,10 +156,14 @@ pub trait MetadataStore: Send + Sync {
         bucket: &str,
         params: ListParams<'_>,
     ) -> Result<ListPage, MetadataError>;
-    async fn list_buckets(&self) -> Result<Vec<String>, MetadataError>;
+    async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError>;
     async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError>;
     async fn get_bucket(&self, name: &str) -> Result<Option<Bucket>, MetadataError>;
     async fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
+    async fn set_bucket_versioning(&self, name: &str, state: BucketVersioning) -> Result<(), MetadataError>;
+    async fn set_bucket_acl(&self, name: &str, acl: Option<Bytes>) -> Result<(), MetadataError>;
+    async fn set_bucket_cors(&self, name: &str, cors: Option<Bytes>) -> Result<(), MetadataError>;
+    async fn set_bucket_lifecycle(&self, name: &str, lifecycle: Option<Bytes>) -> Result<(), MetadataError>;
 }
 
 #[cfg(test)]

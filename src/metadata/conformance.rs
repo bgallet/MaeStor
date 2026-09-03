@@ -570,28 +570,21 @@ pub(crate) async fn list_versions_paginates_across_keys_and_versions(store: impl
     );
 }
 
-pub(crate) async fn list_buckets_returns_distinct_bucket_names(store: impl MetadataStore) {
-    store
-        .put_versioned(sample_metadata("bucket-b", "k", "v1"))
-        .await
-        .expect("put should succeed");
-    store
-        .put_versioned(sample_metadata("bucket-a", "k1", "v1"))
-        .await
-        .expect("put should succeed");
-    store
-        .put_versioned(sample_metadata("bucket-a", "k2", "v1"))
-        .await
-        .expect("put should succeed");
+pub(crate) async fn list_buckets_is_scoped_to_owner_and_sorted(store: impl MetadataStore) {
+    store.create_bucket("b", "owner-1").await.expect("create b");
+    store.create_bucket("a", "owner-1").await.expect("create a");
+    store.create_bucket("m", "owner-2").await.expect("create m");
 
-    let buckets = store
-        .list_buckets()
-        .await
-        .expect("list_buckets should succeed");
-    assert_eq!(
-        buckets,
-        vec!["bucket-a".to_string(), "bucket-b".to_string()]
-    );
+    let owned = store.list_buckets("owner-1").await.expect("list_buckets should succeed");
+    let names: Vec<_> = owned.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"]);
+
+    let others = store.list_buckets("owner-2").await.expect("list_buckets should succeed");
+    let other_names: Vec<_> = others.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(other_names, vec!["m"]);
+
+    let none = store.list_buckets("owner-3").await.expect("list_buckets should succeed");
+    assert!(none.is_empty());
 }
 
 pub(crate) async fn put_unversioned_demotes_existing_versioned_latest_rows(
@@ -750,7 +743,7 @@ pub(crate) async fn an_unknown_content_type_round_trips_verbatim(store: impl Met
 pub(crate) async fn metadata_store_is_object_safe(store: impl MetadataStore + 'static) {
     let store: std::sync::Arc<dyn MetadataStore> = std::sync::Arc::new(store);
     store
-        .list_buckets()
+        .list_buckets("owner-1")
         .await
         .expect("list_buckets should succeed");
 }
@@ -821,7 +814,7 @@ macro_rules! metadata_store_conformance {
             case!($make_store, list_delimiter_page_ends_on_a_common_prefix);
             case!($make_store, list_rejects_a_malformed_cursor);
             case!($make_store, list_versions_paginates_across_keys_and_versions);
-            case!($make_store, list_buckets_returns_distinct_bucket_names);
+            case!($make_store, list_buckets_is_scoped_to_owner_and_sorted);
             case!(
                 $make_store,
                 put_unversioned_demotes_existing_versioned_latest_rows

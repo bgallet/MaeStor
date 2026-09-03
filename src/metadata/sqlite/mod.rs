@@ -193,6 +193,30 @@ impl SqliteMetadataStore {
             }
         }
     }
+
+    /// Shared body for the blob-valued bucket setters. `column` is a static
+    /// literal (`"acl"` / `"cors"` / `"lifecycle"`), never caller data.
+    async fn set_bucket_blob(
+        &self,
+        name: &str,
+        column: &str,
+        value: Option<Bytes>,
+    ) -> Result<(), MetadataError> {
+        let modified = system_time_to_millis(SystemTime::now(), "modified_at")?;
+        let sql = format!("UPDATE buckets SET {column} = ?, modified_at = ? WHERE name = ?");
+        let affected = sqlx::query(&sql)
+            .bind(value.map(|b| b.to_vec()))
+            .bind(modified)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?
+            .rows_affected();
+        if affected == 0 {
+            return Err(MetadataError::NoSuchBucket { name: name.to_string() });
+        }
+        Ok(())
+    }
 }
 
 /// Builds the `list_batch` query string for a given batch shape, with `?`
@@ -733,14 +757,13 @@ impl MetadataStore for SqliteMetadataStore {
         self.list_page(bucket, params, false).await
     }
 
-    async fn list_buckets(&self) -> Result<Vec<String>, MetadataError> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT DISTINCT bucket FROM object_metadata ORDER BY bucket")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(MetadataError::Backend)?;
-
-        Ok(rows.into_iter().map(|(bucket,)| bucket).collect())
+    async fn list_buckets(&self, owner: &str) -> Result<Vec<Bucket>, MetadataError> {
+        let rows = sqlx::query("SELECT * FROM buckets WHERE owner = ? ORDER BY name")
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(MetadataError::Backend)?;
+        rows.iter().map(row_to_bucket).collect()
     }
 
     async fn create_bucket(&self, name: &str, owner: &str) -> Result<Bucket, MetadataError> {
@@ -793,6 +816,44 @@ impl MetadataStore for SqliteMetadataStore {
             .await
             .map_err(MetadataError::Backend)?;
         Ok(())
+    }
+
+    async fn set_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioning,
+    ) -> Result<(), MetadataError> {
+        let modified = system_time_to_millis(SystemTime::now(), "modified_at")?;
+        let affected = sqlx::query(
+            "UPDATE buckets SET versioning = ?, modified_at = ? WHERE name = ?",
+        )
+        .bind(state.as_str())
+        .bind(modified)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(MetadataError::Backend)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(MetadataError::NoSuchBucket { name: name.to_string() });
+        }
+        Ok(())
+    }
+
+    async fn set_bucket_acl(&self, name: &str, acl: Option<Bytes>) -> Result<(), MetadataError> {
+        self.set_bucket_blob(name, "acl", acl).await
+    }
+
+    async fn set_bucket_cors(&self, name: &str, cors: Option<Bytes>) -> Result<(), MetadataError> {
+        self.set_bucket_blob(name, "cors", cors).await
+    }
+
+    async fn set_bucket_lifecycle(
+        &self,
+        name: &str,
+        lifecycle: Option<Bytes>,
+    ) -> Result<(), MetadataError> {
+        self.set_bucket_blob(name, "lifecycle", lifecycle).await
     }
 }
 
