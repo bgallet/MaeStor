@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 pub use types::{
-    CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType, ObjectStorageClass,
-    ObjectVersion,
+    BucketVersioning, CacheControl, ContentType, DataEncryptionContext, Etag, KnownContentType,
+    ObjectStorageClass, ObjectVersion,
 };
 
 #[derive(Debug, Clone, PartialEq)]
