@@ -4,15 +4,15 @@ use std::path::PathBuf;
 use maestor::routing::RoutingConfig;
 use maestor::tls::TlsConfig;
 
-const BIND_ADDR_ENV_VAR: &str = "OPEN_CONDUCTOR_ADDR";
+const BIND_ADDR_ENV_VAR: &str = "MAE_STOR_ADDR";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
-const BASE_DOMAIN_ENV_VAR: &str = "OPEN_CONDUCTOR_BASE_DOMAIN";
-const TLS_CERT_CHAIN_ENV_VAR: &str = "OPEN_CONDUCTOR_TLS_CERT_CHAIN";
-const TLS_PRIVATE_KEY_ENV_VAR: &str = "OPEN_CONDUCTOR_TLS_PRIVATE_KEY";
-const TLS_CLIENT_CA_ENV_VAR: &str = "OPEN_CONDUCTOR_TLS_CLIENT_CA";
+const BASE_DOMAIN_ENV_VAR: &str = "MAE_STOR_BASE_DOMAIN";
+const TLS_CERT_CHAIN_ENV_VAR: &str = "MAE_STOR_TLS_CERT_CHAIN";
+const TLS_PRIVATE_KEY_ENV_VAR: &str = "MAE_STOR_TLS_PRIVATE_KEY";
+const TLS_CLIENT_CA_ENV_VAR: &str = "MAE_STOR_TLS_CLIENT_CA";
 
 /// Treats an empty (or all-whitespace) string as "not configured". Without
-/// this, `OPEN_CONDUCTOR_BASE_DOMAIN=` (set but empty) would produce
+/// this, `MAE_STOR_BASE_DOMAIN=` (set but empty) would produce
 /// `RoutingConfig { base_domain: Some("") }`, and `resolve_virtual_hosted_bucket`
 /// would then match against the suffix `"."` — i.e. any `Host` ending in a
 /// trailing dot — silently turning the entire hostname into a bucket name.
